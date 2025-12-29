@@ -11,8 +11,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from iot_ingest_services.common.db import get_db
-from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
+from iot_ingest_services.ml_service.reading_broker import ReadingBroker
 from iot_ingest_services.ml_service.in_memory_broker import InMemoryReadingBroker
+from .ingest.router import ReadingRouter
 from .schemas import (
     BulkSensorReadingsIn,
     DevicePacketIn,
@@ -30,6 +31,11 @@ app = FastAPI(title="IoT Ingest Service", version="0.3.0")
 # de ML ni ejecuta modelos. ML se suscribe a este broker en otro
 # componente/proceso usando la interfaz ReadingBroker.
 _broker: ReadingBroker = InMemoryReadingBroker()
+
+# Router central para clasificación y enrutamiento a pipelines
+# Se inicializa por request para evitar problemas de estado compartido
+def _get_router(db: Session) -> ReadingRouter:
+    return ReadingRouter(db, _broker)
 
 # Simple per-process cache.
 # Key: (device_uuid, sensor_uuid) -> (sensor_id, expires_at_utc)
@@ -55,52 +61,55 @@ def _cache_ttl_seconds() -> int:
     return int(os.getenv("SENSOR_MAP_TTL_SECONDS", "300"))
 
 
-def _exec_insert_sp(db: Session, sensor_id: int, value: float) -> None:
-    # Keep all threshold/alert logic inside SQL Server.
-    # The SP also handles inserting into sensor_readings.
-    db.execute(
-        text(
-            "EXEC sp_insert_reading_and_check_threshold "
-            "@p_sensor_id = :sensor_id, @p_value = :value"
-        ),
-        {"sensor_id": sensor_id, "value": value},
-    )
+def _ingest_single_reading(
+    db: Session,
+    sensor_id: int,
+    value: float,
+    device_timestamp: datetime | None = None,
+) -> None:
+    """Ingesta de una sola lectura usando clasificación por propósito.
 
-    # Publicar lectura en el broker para consumo por ML online.
-    # Aquí no ejecutamos lógica de ML ni interpretamos thresholds;
-    # solo enviamos el dato crudo a la capa de inteligencia.
-    now_ts = datetime.now(timezone.utc).timestamp()
-    reading = Reading(
+    Clasifica la lectura ANTES de persistir y la envía al pipeline correspondiente.
+    Mantiene compatibilidad con endpoints existentes.
+    """
+    router = _get_router(db)
+    router.classify_and_route(
         sensor_id=sensor_id,
-        sensor_type="unknown",  # opcional: resolver desde BD si lo necesitas
-        value=float(value),
-        timestamp=now_ts,
+        value=value,
+        device_timestamp=device_timestamp,
     )
-    _broker.publish(reading)
 
 
-def _try_exec_bulk_json(db: Session, rows: list[dict]) -> bool:
-    # Preferred path: 1 DB call per packet/batch.
-    # rows item format: {sensor_id:int, value:float, device_timestamp?:str}
-    payload = json.dumps(rows)
+def _ingest_bulk_readings(
+    db: Session,
+    rows: list[dict],
+) -> None:
+    """Ingesta en lote usando clasificación por propósito.
 
-    try:
-        db.execute(
-            text(
-                "EXEC sp_insert_readings_bulk_json_and_check_threshold "
-                "@p_readings_json = :payload"
-            ),
-            {"payload": payload},
+    Procesa cada lectura individualmente con clasificación,
+    enrutando a los pipelines correspondientes.
+
+    rows format: {sensor_id:int, value:float, device_timestamp?:datetime}
+    """
+    router = _get_router(db)
+
+    for row in rows:
+        sensor_id = int(row["sensor_id"])
+        value = float(row["value"])
+        device_ts = row.get("device_timestamp")
+        if device_ts and isinstance(device_ts, str):
+            # Parse ISO format string if needed
+            try:
+                device_ts = datetime.fromisoformat(device_ts.replace("Z", "+00:00"))
+            except Exception:
+                device_ts = None
+
+        # Clasificar y enrutar al pipeline correspondiente
+        router.classify_and_route(
+            sensor_id=sensor_id,
+            value=value,
+            device_timestamp=device_ts,
         )
-        return True
-    except Exception as e:
-        # If the patch wasn't applied yet, fallback to the per-reading SP.
-        msg = str(e)
-        if "Could not find stored procedure" in msg and "sp_insert_readings_bulk_json_and_check_threshold" in msg:
-            return False
-        if "sp_insert_readings_bulk_json_and_check_threshold" in msg and "could not" in msg.lower():
-            return False
-        raise
 
 
 def _resolve_sensor_id(db: Session, device_uuid: UUID, sensor_uuid: UUID) -> int | None:
@@ -137,8 +146,18 @@ def _resolve_sensor_id(db: Session, device_uuid: UUID, sensor_uuid: UUID) -> int
 # Legacy endpoint (by internal sensor_id). Kept for compatibility/testing.
 @app.post("/ingest/readings", response_model=IngestResult, dependencies=[Depends(_require_api_key)])
 def ingest_reading(payload: SensorReadingIn, db: Session = Depends(get_db)):
+    """Endpoint legacy: ingesta de una lectura por sensor_id.
+
+    Usa la nueva arquitectura de clasificación por propósito.
+    """
     try:
-        _exec_insert_sp(db, payload.sensor_id, float(payload.value))
+        device_ts = payload.timestamp
+        _ingest_single_reading(
+            db=db,
+            sensor_id=payload.sensor_id,
+            value=float(payload.value),
+            device_timestamp=device_ts,
+        )
         db.commit()
         return IngestResult(inserted=1)
     except Exception as e:
@@ -149,17 +168,24 @@ def ingest_reading(payload: SensorReadingIn, db: Session = Depends(get_db)):
 # Legacy bulk endpoint (by internal sensor_id). Kept for compatibility/testing.
 @app.post("/ingest/readings/bulk", response_model=IngestResult, dependencies=[Depends(_require_api_key)])
 def ingest_readings_bulk(payload: BulkSensorReadingsIn, db: Session = Depends(get_db)):
+    """Endpoint legacy: ingesta en lote por sensor_id.
+
+    Usa la nueva arquitectura de clasificación por propósito.
+    """
     if not payload.readings:
         return IngestResult(inserted=0)
 
-    rows = [{"sensor_id": r.sensor_id, "value": float(r.value)} for r in payload.readings]
+    rows = [
+        {
+            "sensor_id": r.sensor_id,
+            "value": float(r.value),
+            "device_timestamp": r.timestamp,
+        }
+        for r in payload.readings
+    ]
 
     try:
-        used_bulk = _try_exec_bulk_json(db, rows)
-        if not used_bulk:
-            for r in rows:
-                _exec_insert_sp(db, int(r["sensor_id"]), float(r["value"]))
-
+        _ingest_bulk_readings(db, rows)
         db.commit()
         return IngestResult(inserted=len(rows))
     except Exception as e:
@@ -170,6 +196,13 @@ def ingest_readings_bulk(payload: BulkSensorReadingsIn, db: Session = Depends(ge
 # Recommended endpoint: device packet with multiple sensor readings using UUIDs.
 @app.post("/ingest/packets", response_model=PacketIngestResult, dependencies=[Depends(_require_api_key)])
 def ingest_packet(payload: DevicePacketIn, db: Session = Depends(get_db)):
+    """Endpoint recomendado: ingesta de paquete por dispositivo usando UUIDs.
+
+    Usa la nueva arquitectura de clasificación por propósito:
+    - Clasifica cada lectura ANTES de persistir
+    - Enruta a flujos separados (alert/warning/prediction)
+    - Solo publica datos limpios en el broker ML
+    """
     if not payload.readings:
         return PacketIngestResult(inserted=0, unknown_sensors=[])
 
@@ -177,7 +210,6 @@ def ingest_packet(payload: DevicePacketIn, db: Session = Depends(get_db)):
     rows: list[dict] = []
 
     device_ts = payload.ts
-    device_ts_iso = device_ts.isoformat() if device_ts is not None else None
 
     try:
         for r in payload.readings:
@@ -187,26 +219,13 @@ def ingest_packet(payload: DevicePacketIn, db: Session = Depends(get_db)):
                 continue
 
             row = {"sensor_id": sensor_id, "value": float(r.value)}
-            if device_ts_iso is not None:
-                row["device_timestamp"] = device_ts_iso
+            if device_ts is not None:
+                row["device_timestamp"] = device_ts
             rows.append(row)
 
         if rows:
-            used_bulk = _try_exec_bulk_json(db, rows)
-            if not used_bulk:
-                for r in rows:
-                    _exec_insert_sp(db, int(r["sensor_id"]), float(r["value"]))
-            else:
-                # Si usamos el SP bulk, publicamos lecturas también en el broker.
-                now_ts = datetime.now(timezone.utc).timestamp()
-                for r in rows:
-                    reading = Reading(
-                        sensor_id=int(r["sensor_id"]),
-                        sensor_type="unknown",
-                        value=float(r["value"]),
-                        timestamp=now_ts,
-                    )
-                    _broker.publish(reading)
+            # Usar la nueva arquitectura de clasificación por propósito
+            _ingest_bulk_readings(db, rows)
 
         db.commit()
         return PacketIngestResult(inserted=len(rows), unknown_sensors=unknown)

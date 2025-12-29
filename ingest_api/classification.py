@@ -1,0 +1,347 @@
+"""Módulo de clasificación de lecturas por propósito.
+
+Este módulo clasifica las lecturas ANTES de persistir o enviar a otros servicios,
+dividiéndolas en 3 flujos lógicos:
+
+1. ALERTAS (hard rules): Violaciones de rango físico del sensor
+2. ADVERTENCIAS (delta/spike): Cambios rápidos detectados por delta/slope
+3. ML/PREDICCIÓN: Datos limpios para machine learning
+
+Reglas críticas:
+- Nunca puede existir valor fuera de rango físico con severity = low
+- Si hay violación física, ML NO puede bajar severidad
+- Si hay DELTA_SPIKE reciente, severity ≥ warning
+- Una alerta/advertencia/predicción por sensor, no acumulable
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Optional
+
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import Session
+
+
+class ReadingClass(Enum):
+    """Clasificación de una lectura según su propósito."""
+
+    ALERT = "alert"  # Violación de rango físico
+    WARNING = "warning"  # Delta spike detectado
+    ML_PREDICTION = "ml_prediction"  # Dato limpio para ML
+
+
+@dataclass
+class PhysicalRange:
+    """Rango físico del sensor (hard limits)."""
+
+    min_value: Optional[float]
+    max_value: Optional[float]
+    threshold_id: Optional[int] = None
+
+
+@dataclass
+class DeltaThreshold:
+    """Umbrales de detección de delta/spike."""
+
+    abs_delta: Optional[float] = None
+    rel_delta: Optional[float] = None
+    abs_slope: Optional[float] = None
+    rel_slope: Optional[float] = None
+    severity: str = "warning"
+
+
+@dataclass
+class LastReading:
+    """Última lectura conocida del sensor."""
+
+    value: float
+    timestamp: datetime
+    reading_id: Optional[int] = None
+
+
+@dataclass
+class ClassifiedReading:
+    """Resultado de la clasificación de una lectura."""
+
+    sensor_id: int
+    value: float
+    device_timestamp: Optional[datetime]
+    classification: ReadingClass
+    physical_range: Optional[PhysicalRange] = None
+    delta_info: Optional[dict] = None
+    reason: str = ""
+
+
+class ReadingClassifier:
+    """Clasificador de lecturas por propósito."""
+
+    def __init__(self, db: Session | Connection) -> None:
+        """Inicializa el clasificador con una Session o Connection."""
+        self._db = db
+        self._range_cache: dict[int, Optional[PhysicalRange]] = {}
+        self._delta_cache: dict[int, Optional[DeltaThreshold]] = {}
+        self._last_reading_cache: dict[int, Optional[LastReading]] = {}
+
+    def classify(
+        self,
+        sensor_id: int,
+        value: float,
+        device_timestamp: Optional[datetime] = None,
+        ingest_timestamp: Optional[datetime] = None,
+    ) -> ClassifiedReading:
+        """Clasifica una lectura según su propósito.
+
+        Orden de evaluación:
+        1. Verificar violación de rango físico → ALERT
+        2. Verificar delta spike → WARNING
+        3. Resto → ML_PREDICTION (dato limpio)
+
+        Args:
+            sensor_id: ID del sensor
+            value: Valor de la lectura
+            device_timestamp: Timestamp del dispositivo (opcional)
+            ingest_timestamp: Timestamp de ingesta (opcional, default: ahora)
+
+        Returns:
+            ClassifiedReading con la clasificación y metadata
+        """
+        if ingest_timestamp is None:
+            ingest_timestamp = datetime.now(timezone.utc)
+
+        # 1. Verificar violación de rango físico (hard rule)
+        physical_range = self._get_physical_range(sensor_id)
+        if physical_range and self._violates_physical_range(value, physical_range):
+            return ClassifiedReading(
+                sensor_id=sensor_id,
+                value=value,
+                device_timestamp=device_timestamp,
+                classification=ReadingClass.ALERT,
+                physical_range=physical_range,
+                reason=f"Valor {value} fuera de rango físico [{physical_range.min_value}, {physical_range.max_value}]",
+            )
+
+        # 2. Verificar delta spike (cambios rápidos)
+        last_reading = self._get_last_reading(sensor_id)
+        if last_reading:
+            delta_info = self._check_delta_spike(
+                sensor_id=sensor_id,
+                current_value=value,
+                current_ts=ingest_timestamp,
+                last_reading=last_reading,
+            )
+            if delta_info and delta_info.get("is_spike", False):
+                return ClassifiedReading(
+                    sensor_id=sensor_id,
+                    value=value,
+                    device_timestamp=device_timestamp,
+                    classification=ReadingClass.WARNING,
+                    delta_info=delta_info,
+                    reason=f"Delta spike detectado: {delta_info.get('reason', '')}",
+                )
+
+        # 3. Dato limpio para ML (sin violación física ni delta spike fuerte)
+        return ClassifiedReading(
+            sensor_id=sensor_id,
+            value=value,
+            device_timestamp=device_timestamp,
+            classification=ReadingClass.ML_PREDICTION,
+            reason="Dato dentro de rango físico y sin delta spike significativo",
+        )
+
+    def _get_physical_range(self, sensor_id: int) -> Optional[PhysicalRange]:
+        """Obtiene el rango físico del sensor desde alert_thresholds.
+
+        Busca un threshold activo con condition_type='out_of_range' que define
+        los límites físicos del sensor.
+        """
+        if sensor_id in self._range_cache:
+            return self._range_cache[sensor_id]
+
+        row = self._db.execute(
+            text(
+                """
+                SELECT TOP 1
+                    id,
+                    threshold_value_min,
+                    threshold_value_max
+                FROM dbo.alert_thresholds
+                WHERE sensor_id = :sensor_id
+                  AND is_active = 1
+                  AND condition_type = 'out_of_range'
+                ORDER BY id ASC
+                """
+            ),
+            {"sensor_id": sensor_id},
+        ).fetchone()
+
+        if not row:
+            self._range_cache[sensor_id] = None
+            return None
+
+        min_val = float(row.threshold_value_min) if row.threshold_value_min is not None else None
+        max_val = float(row.threshold_value_max) if row.threshold_value_max is not None else None
+
+        if min_val is None and max_val is None:
+            self._range_cache[sensor_id] = None
+            return None
+
+        physical_range = PhysicalRange(
+            min_value=min_val,
+            max_value=max_val,
+            threshold_id=int(row.id),
+        )
+        self._range_cache[sensor_id] = physical_range
+        return physical_range
+
+    def _violates_physical_range(self, value: float, physical_range: PhysicalRange) -> bool:
+        """Verifica si un valor viola el rango físico."""
+        if physical_range.min_value is not None and value < physical_range.min_value:
+            return True
+        if physical_range.max_value is not None and value > physical_range.max_value:
+            return True
+        return False
+
+    def _get_delta_threshold(self, sensor_id: int) -> Optional[DeltaThreshold]:
+        """Obtiene los umbrales de delta para el sensor."""
+        if sensor_id in self._delta_cache:
+            return self._delta_cache[sensor_id]
+
+        row = self._db.execute(
+            text(
+                """
+                SELECT TOP 1
+                    abs_delta,
+                    rel_delta,
+                    abs_slope,
+                    rel_slope,
+                    severity
+                FROM dbo.delta_thresholds
+                WHERE sensor_id = :sensor_id
+                  AND is_active = 1
+                ORDER BY id ASC
+                """
+            ),
+            {"sensor_id": sensor_id},
+        ).fetchone()
+
+        if not row:
+            self._delta_cache[sensor_id] = None
+            return None
+
+        delta_threshold = DeltaThreshold(
+            abs_delta=float(row.abs_delta) if row.abs_delta is not None else None,
+            rel_delta=float(row.rel_delta) if row.rel_delta is not None else None,
+            abs_slope=float(row.abs_slope) if row.abs_slope is not None else None,
+            rel_slope=float(row.rel_slope) if row.rel_slope is not None else None,
+            severity=str(row.severity or "warning"),
+        )
+        self._delta_cache[sensor_id] = delta_threshold
+        return delta_threshold
+
+    def _get_last_reading(self, sensor_id: int) -> Optional[LastReading]:
+        """Obtiene la última lectura del sensor desde sensor_readings_latest."""
+        if sensor_id in self._last_reading_cache:
+            return self._last_reading_cache[sensor_id]
+
+        row = self._db.execute(
+            text(
+                """
+                SELECT TOP 1
+                    latest_value,
+                    latest_timestamp
+                FROM dbo.sensor_readings_latest
+                WHERE sensor_id = :sensor_id
+                """
+            ),
+            {"sensor_id": sensor_id},
+        ).fetchone()
+
+        if not row:
+            self._last_reading_cache[sensor_id] = None
+            return None
+
+        last_reading = LastReading(
+            value=float(row.latest_value),
+            timestamp=row.latest_timestamp,
+        )
+        self._last_reading_cache[sensor_id] = last_reading
+        return last_reading
+
+    def _check_delta_spike(
+        self,
+        sensor_id: int,
+        current_value: float,
+        current_ts: datetime,
+        last_reading: LastReading,
+    ) -> Optional[dict]:
+        """Verifica si hay un delta spike usando umbrales de delta/slope.
+
+        Calcula:
+        - Delta absoluto: |current - last|
+        - Delta relativo: |delta| / |last|
+        - Slope absoluto: |delta| / dt (unidades/segundo)
+        - Slope relativo: (|delta|/|last|) / dt (1/segundo)
+
+        Returns:
+            dict con is_spike=True si se detecta spike, None en caso contrario
+        """
+        delta_threshold = self._get_delta_threshold(sensor_id)
+        if not delta_threshold:
+            # Sin umbrales de delta configurados, no detectamos spikes
+            return None
+
+        # Calcular delta y dt
+        delta_abs = abs(current_value - last_reading.value)
+        dt_seconds = (current_ts - last_reading.timestamp).total_seconds()
+
+        # Evitar división por cero o dt negativo
+        if dt_seconds <= 0:
+            dt_seconds = 0.001  # 1ms mínimo para cálculos
+
+        delta_rel = 0.0
+        if abs(last_reading.value) > 1e-6:
+            delta_rel = abs(delta_abs / last_reading.value)
+
+        slope_abs = delta_abs / dt_seconds
+        slope_rel = delta_rel / dt_seconds if dt_seconds > 0 else 0.0
+
+        # Verificar umbrales
+        triggered = []
+        reason_parts = []
+
+        if delta_threshold.abs_delta is not None and delta_abs >= delta_threshold.abs_delta:
+            triggered.append("abs_delta")
+            reason_parts.append(f"delta_abs={delta_abs:.4f} >= {delta_threshold.abs_delta:.4f}")
+
+        if delta_threshold.rel_delta is not None and delta_rel >= delta_threshold.rel_delta:
+            triggered.append("rel_delta")
+            reason_parts.append(f"delta_rel={delta_rel:.4%} >= {delta_threshold.rel_delta:.4%}")
+
+        if delta_threshold.abs_slope is not None and slope_abs >= delta_threshold.abs_slope:
+            triggered.append("abs_slope")
+            reason_parts.append(f"slope_abs={slope_abs:.4f} >= {delta_threshold.abs_slope:.4f}")
+
+        if delta_threshold.rel_slope is not None and slope_rel >= delta_threshold.rel_slope:
+            triggered.append("rel_slope")
+            reason_parts.append(f"slope_rel={slope_rel:.4f} >= {delta_threshold.rel_slope:.4f}")
+
+        if not triggered:
+            return None
+
+        return {
+            "is_spike": True,
+            "delta_abs": delta_abs,
+            "delta_rel": delta_rel,
+            "slope_abs": slope_abs,
+            "slope_rel": slope_rel,
+            "dt_seconds": dt_seconds,
+            "last_value": last_reading.value,
+            "triggered_thresholds": triggered,
+            "severity": delta_threshold.severity,
+            "reason": "; ".join(reason_parts),
+        }
+
