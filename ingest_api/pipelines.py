@@ -14,6 +14,7 @@ Reglas estrictas:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -22,6 +23,7 @@ from sqlalchemy.orm import Session
 from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
 from .classification import ReadingClassifier, ReadingClass, ClassifiedReading
 from .ingest_flows import ingest_alert, ingest_warning, ingest_prediction
+from .ingest.predictions.prediction_dispatch import should_skip_prediction
 
 
 def classify_reading(
@@ -106,7 +108,28 @@ def handle_prediction_pipeline(
     - Publica en el broker ML para procesamiento online
     - NO guarda todas las lecturas masivamente
     """
+    logger = logging.getLogger(__name__)
+
+    # Regla PREDICTION (dedupe): si es igual al latest limpio, NO actualizar latest ni publicar a ML.
+    skip, reason = should_skip_prediction(db, sensor_id=sensor_id, value=value)
+    if skip:
+        logger.info(
+            "INGEST SKIP PREDICTION sensor_id=%s value=%s ts=%s reason=%s",
+            sensor_id,
+            value,
+            ingest_timestamp.isoformat(),
+            reason,
+        )
+        return
+
     ingest_prediction(db, classified, ingest_timestamp)
+    logger.info(
+        "INGEST PERSIST PREDICTION sensor_id=%s value=%s ts=%s reason=%s",
+        sensor_id,
+        value,
+        ingest_timestamp.isoformat(),
+        reason,
+    )
 
     # PREDICTION_PIPELINE: Solo datos limpios van al ML
     now_ts = ingest_timestamp.timestamp()

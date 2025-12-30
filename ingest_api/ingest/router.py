@@ -5,6 +5,7 @@ Cada lectura se clasifica UNA VEZ y se enruta a exactamente UN pipeline.
 """
 
 from __future__ import annotations
+import logging
 
 from datetime import datetime, timezone
 from enum import Enum
@@ -37,6 +38,7 @@ class ReadingRouter:
         self._alert_pipeline = AlertIngestPipeline(db)
         self._warning_pipeline = WarningIngestPipeline(db)
         self._prediction_pipeline = PredictionIngestPipeline(db, broker)
+        self._logger = logging.getLogger(__name__)
 
     def classify_and_route(
         self,
@@ -67,12 +69,38 @@ class ReadingRouter:
         # 1. Verificar violación de rango físico (ALERT pipeline)
         physical_range = get_physical_range(self._db, sensor_id)
         if physical_range and physical_range.violates(value):
-            self._alert_pipeline.ingest(
-                sensor_id=sensor_id,
-                value=value,
-                ingest_timestamp=ingest_timestamp,
-                device_timestamp=device_timestamp,
-            )
+            try:
+                self._alert_pipeline.ingest(
+                    sensor_id=sensor_id,
+                    value=value,
+                    ingest_timestamp=ingest_timestamp,
+                    device_timestamp=device_timestamp,
+                )
+                self._logger.info(
+                    "INGEST PERSIST ALERT sensor_id=%s value=%s ts=%s",
+                    sensor_id,
+                    value,
+                    ingest_timestamp.isoformat(),
+                )
+            except ValueError as e:
+                # Error esperado de validación/aceptación (no debe ocurrir si la clasificación está bien)
+                self._logger.info(
+                    "INGEST SKIP ALERT sensor_id=%s value=%s ts=%s reason=%s",
+                    sensor_id,
+                    value,
+                    ingest_timestamp.isoformat(),
+                    str(e),
+                )
+            except Exception as e:
+                # Error real (DB/persistencia): hacerlo visible y forzar rollback del request
+                self._logger.exception(
+                    "INGEST ERROR ALERT sensor_id=%s value=%s ts=%s err=%s",
+                    sensor_id,
+                    value,
+                    ingest_timestamp.isoformat(),
+                    type(e).__name__,
+                )
+                raise
             return PipelineType.ALERT
 
         # 2. Verificar delta spike (WARNING pipeline)
@@ -87,20 +115,90 @@ class ReadingRouter:
                     delta_threshold=delta_threshold,
                 )
                 if delta_info and delta_info.get("is_spike", False):
-                    self._warning_pipeline.ingest(
-                        sensor_id=sensor_id,
-                        value=value,
-                        ingest_timestamp=ingest_timestamp,
-                        device_timestamp=device_timestamp,
-                    )
+                    try:
+                        self._warning_pipeline.ingest(
+                            sensor_id=sensor_id,
+                            value=value,
+                            ingest_timestamp=ingest_timestamp,
+                            device_timestamp=device_timestamp,
+                        )
+                        self._logger.info(
+                            "INGEST PERSIST WARNING sensor_id=%s value=%s ts=%s reason=%s",
+                            sensor_id,
+                            value,
+                            ingest_timestamp.isoformat(),
+                            delta_info.get("reason"),
+                        )
+                    except ValueError as e:
+                        self._logger.info(
+                            "INGEST SKIP WARNING sensor_id=%s value=%s ts=%s reason=%s",
+                            sensor_id,
+                            value,
+                            ingest_timestamp.isoformat(),
+                            str(e),
+                        )
+                    except Exception as e:
+                        self._logger.exception(
+                            "INGEST ERROR WARNING sensor_id=%s value=%s ts=%s err=%s",
+                            sensor_id,
+                            value,
+                            ingest_timestamp.isoformat(),
+                            type(e).__name__,
+                        )
+                        raise
                     return PipelineType.WARNING
 
+                self._logger.info(
+                    "INGEST SKIP WARNING sensor_id=%s value=%s ts=%s reason=no_spike",
+                    sensor_id,
+                    value,
+                    ingest_timestamp.isoformat(),
+                )
+            else:
+                self._logger.info(
+                    "INGEST SKIP WARNING sensor_id=%s value=%s ts=%s reason=no_delta_threshold",
+                    sensor_id,
+                    value,
+                    ingest_timestamp.isoformat(),
+                )
+        else:
+            self._logger.info(
+                "INGEST SKIP WARNING sensor_id=%s value=%s ts=%s reason=no_last_clean",
+                sensor_id,
+                value,
+                ingest_timestamp.isoformat(),
+            )
+
         # 3. Dato limpio para ML (PREDICTION pipeline)
-        self._prediction_pipeline.ingest(
-            sensor_id=sensor_id,
-            value=value,
-            ingest_timestamp=ingest_timestamp,
-            device_timestamp=device_timestamp,
-        )
+        try:
+            self._prediction_pipeline.ingest(
+                sensor_id=sensor_id,
+                value=value,
+                ingest_timestamp=ingest_timestamp,
+                device_timestamp=device_timestamp,
+            )
+            self._logger.info(
+                "INGEST ROUTED PREDICTION sensor_id=%s value=%s ts=%s",
+                sensor_id,
+                value,
+                ingest_timestamp.isoformat(),
+            )
+        except ValueError as e:
+            self._logger.info(
+                "INGEST SKIP PREDICTION sensor_id=%s value=%s ts=%s reason=%s",
+                sensor_id,
+                value,
+                ingest_timestamp.isoformat(),
+                str(e),
+            )
+        except Exception as e:
+            self._logger.exception(
+                "INGEST ERROR PREDICTION sensor_id=%s value=%s ts=%s err=%s",
+                sensor_id,
+                value,
+                ingest_timestamp.isoformat(),
+                type(e).__name__,
+            )
+            raise
         return PipelineType.PREDICTION
 

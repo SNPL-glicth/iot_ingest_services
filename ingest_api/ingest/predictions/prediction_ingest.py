@@ -5,6 +5,7 @@ Este pipeline procesa exclusivamente datos limpios para ML.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -12,7 +13,11 @@ from sqlalchemy.orm import Session
 from iot_ingest_services.ml_service.reading_broker import ReadingBroker
 
 from .prediction_rules import PredictionRules
-from .prediction_dispatch import update_latest_reading, dispatch_to_ml_broker
+from .prediction_dispatch import (
+    dispatch_to_ml_broker,
+    should_skip_prediction,
+    update_latest_reading,
+)
 
 
 class PredictionIngestPipeline:
@@ -21,6 +26,7 @@ class PredictionIngestPipeline:
     def __init__(self, db: Session, broker: ReadingBroker) -> None:
         self._db = db
         self._broker = broker
+        self._logger = logging.getLogger(__name__)
 
     def ingest(
         self,
@@ -53,7 +59,20 @@ class PredictionIngestPipeline:
                 f"Los datos deben estar limpios (sin violación física ni delta spike)."
             )
 
-        # Actualizar último valor (pero NO persistir lectura completa)
+        # Regla PREDICTION (dedupe): comparar contra sensor_readings_latest.
+        # - Igual EXACTO (comparación robusta) => NO persistir (ni latest) y NO enviar al ML.
+        # - Cambio (aunque sea mínimo) => actualizar latest y enviar al ML.
+        skip, reason = should_skip_prediction(self._db, sensor_id=sensor_id, value=value)
+        if skip:
+            self._logger.info(
+                "INGEST SKIP PREDICTION sensor_id=%s value=%s ts=%s reason=%s",
+                sensor_id,
+                value,
+                ingest_timestamp.isoformat(),
+                reason,
+            )
+            return
+
         if PredictionRules.should_update_latest():
             update_latest_reading(
                 db=self._db,
@@ -62,12 +81,19 @@ class PredictionIngestPipeline:
                 ingest_timestamp=ingest_timestamp,
             )
 
-        # Regla estricta: PREDICTION pipeline SIEMPRE envía datos limpios al ML
+        self._logger.info(
+            "INGEST PERSIST PREDICTION sensor_id=%s value=%s ts=%s reason=%s",
+            sensor_id,
+            value,
+            ingest_timestamp.isoformat(),
+            reason,
+        )
+
         if PredictionRules.should_forward_to_ml():
             dispatch_to_ml_broker(
                 broker=self._broker,
                 sensor_id=sensor_id,
-                value=value,  # Conservar decimales completos
+                value=value,
                 ingest_timestamp=ingest_timestamp,
             )
 

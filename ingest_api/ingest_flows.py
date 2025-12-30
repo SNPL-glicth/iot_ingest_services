@@ -46,32 +46,7 @@ def ingest_alert(
         # Sin rango físico, no podemos generar alerta
         return
 
-    # 1. Actualizar última lectura (siempre, para mantener estado actualizado)
-    db.execute(
-        text(
-            """
-            MERGE dbo.sensor_readings_latest AS tgt
-            USING (
-                SELECT :sensor_id AS sensor_id, :value AS latest_value, :ts AS latest_timestamp
-            ) AS src
-                ON tgt.sensor_id = src.sensor_id
-            WHEN MATCHED THEN
-                UPDATE SET
-                    tgt.latest_value = src.latest_value,
-                    tgt.latest_timestamp = src.latest_timestamp
-            WHEN NOT MATCHED THEN
-                INSERT (sensor_id, latest_value, latest_timestamp)
-                VALUES (src.sensor_id, src.latest_value, src.latest_timestamp);
-            """
-        ),
-        {
-            "sensor_id": sensor_id,
-            "value": value,
-            "ts": ingest_timestamp,
-        },
-    )
-
-    # 2. Guardar la lectura que rompe el umbral (evento relevante)
+    # Guardar la lectura que rompe el umbral (evento relevante)
     device_ts = classified.device_timestamp
     db.execute(
         text(
@@ -162,32 +137,7 @@ def ingest_warning(
     if not delta_info or not delta_info.get("is_spike", False):
         return
 
-    # 1. Actualizar última lectura (mantener estado actualizado)
-    db.execute(
-        text(
-            """
-            MERGE dbo.sensor_readings_latest AS tgt
-            USING (
-                SELECT :sensor_id AS sensor_id, :value AS latest_value, :ts AS latest_timestamp
-            ) AS src
-                ON tgt.sensor_id = src.sensor_id
-            WHEN MATCHED THEN
-                UPDATE SET
-                    tgt.latest_value = src.latest_value,
-                    tgt.latest_timestamp = src.latest_timestamp
-            WHEN NOT MATCHED THEN
-                INSERT (sensor_id, latest_value, latest_timestamp)
-                VALUES (src.sensor_id, src.latest_value, src.latest_timestamp);
-            """
-        ),
-        {
-            "sensor_id": sensor_id,
-            "value": value,
-            "ts": ingest_timestamp,
-        },
-    )
-
-    # 2. Guardar el evento de delta spike (lectura relevante)
+    # Guardar el evento de delta spike (lectura relevante)
     device_ts = classified.device_timestamp
     db.execute(
         text(

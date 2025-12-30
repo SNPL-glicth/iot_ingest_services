@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import text
@@ -28,6 +28,12 @@ class LastReading:
     value: float
     timestamp: datetime
     reading_id: Optional[int] = None
+
+
+def _to_utc_aware(ts: datetime) -> datetime:
+    if ts.tzinfo is None or ts.tzinfo.utcoffset(ts) is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 def get_delta_threshold(db: Session, sensor_id: int) -> Optional[DeltaThreshold]:
@@ -105,7 +111,9 @@ def check_delta_spike(
     """
     # Calcular delta y dt
     delta_abs = abs(current_value - last_reading.value)
-    dt_seconds = (current_ts - last_reading.timestamp).total_seconds()
+    current_ts_utc = _to_utc_aware(current_ts)
+    last_ts_utc = _to_utc_aware(last_reading.timestamp)
+    dt_seconds = (current_ts_utc - last_ts_utc).total_seconds()
 
     # Evitar división por cero o dt negativo
     if dt_seconds <= 0:
@@ -122,19 +130,26 @@ def check_delta_spike(
     triggered = []
     reason_parts = []
 
-    if delta_threshold.abs_delta is not None and delta_abs >= delta_threshold.abs_delta:
-        triggered.append("abs_delta")
-        reason_parts.append(f"delta_abs={delta_abs:.4f} >= {delta_threshold.abs_delta:.4f}")
+    # Regla WARNING: si hay abs_delta configurado, usar delta ENTERO y estrictamente mayor ("supera")
+    # para evitar falsos positivos por decimales mínimos.
+    integer_delta_abs = int(delta_abs)
+    if delta_threshold.abs_delta is not None:
+        integer_threshold = int(delta_threshold.abs_delta)
+        if integer_delta_abs > integer_threshold:
+            triggered.append("abs_delta")
+            reason_parts.append(
+                f"delta_int={integer_delta_abs} > {integer_threshold} (delta_abs={delta_abs:.6f})"
+            )
 
-    if delta_threshold.rel_delta is not None and delta_rel >= delta_threshold.rel_delta:
+    if delta_threshold.abs_delta is None and delta_threshold.rel_delta is not None and delta_rel >= delta_threshold.rel_delta:
         triggered.append("rel_delta")
         reason_parts.append(f"delta_rel={delta_rel:.4%} >= {delta_threshold.rel_delta:.4%}")
 
-    if delta_threshold.abs_slope is not None and slope_abs >= delta_threshold.abs_slope:
+    if delta_threshold.abs_delta is None and delta_threshold.abs_slope is not None and slope_abs >= delta_threshold.abs_slope:
         triggered.append("abs_slope")
         reason_parts.append(f"slope_abs={slope_abs:.4f} >= {delta_threshold.abs_slope:.4f}")
 
-    if delta_threshold.rel_slope is not None and slope_rel >= delta_threshold.rel_slope:
+    if delta_threshold.abs_delta is None and delta_threshold.rel_slope is not None and slope_rel >= delta_threshold.rel_slope:
         triggered.append("rel_slope")
         reason_parts.append(f"slope_rel={slope_rel:.4f} >= {delta_threshold.rel_slope:.4f}")
 
@@ -144,6 +159,7 @@ def check_delta_spike(
     return {
         "is_spike": True,
         "delta_abs": delta_abs,
+        "delta_int": integer_delta_abs,
         "delta_rel": delta_rel,
         "slope_abs": slope_abs,
         "slope_rel": slope_rel,

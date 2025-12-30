@@ -2,12 +2,57 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
+
+
+def _to_decimal(value: float) -> Decimal | None:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def get_latest_value(db: Session, sensor_id: int) -> float | None:
+    row = db.execute(
+        text(
+            """
+            SELECT TOP 1 latest_value
+            FROM dbo.sensor_readings_latest
+            WHERE sensor_id = :sensor_id
+            """
+        ),
+        {"sensor_id": sensor_id},
+    ).fetchone()
+    if not row:
+        return None
+    return float(row[0])
+
+
+def should_skip_prediction(
+    db: Session,
+    sensor_id: int,
+    value: float,
+) -> tuple[bool, str]:
+    latest = get_latest_value(db, sensor_id)
+    if latest is None:
+        return False, "no_latest"
+
+    a = _to_decimal(value)
+    b = _to_decimal(latest)
+    if a is None or b is None:
+        # Fallback defensivo: no filtrar si no podemos comparar con seguridad
+        return False, "bad_decimal"
+
+    if a == b:
+        return True, "same_as_latest"
+
+    return False, "changed"
 
 
 def update_latest_reading(

@@ -26,32 +26,7 @@ def persist_alert(
     - Cierra alertas activas previas del mismo sensor (1 alerta activa por sensor)
     - Crea nueva alerta activa con severity=critical
     """
-    # 1. Actualizar última lectura (siempre, para mantener estado actualizado)
-    db.execute(
-        text(
-            """
-            MERGE dbo.sensor_readings_latest AS tgt
-            USING (
-                SELECT :sensor_id AS sensor_id, :value AS latest_value, :ts AS latest_timestamp
-            ) AS src
-                ON tgt.sensor_id = src.sensor_id
-            WHEN MATCHED THEN
-                UPDATE SET
-                    tgt.latest_value = src.latest_value,
-                    tgt.latest_timestamp = src.latest_timestamp
-            WHEN NOT MATCHED THEN
-                INSERT (sensor_id, latest_value, latest_timestamp)
-                VALUES (src.sensor_id, src.latest_value, src.latest_timestamp);
-            """
-        ),
-        {
-            "sensor_id": sensor_id,
-            "value": value,
-            "ts": ingest_timestamp,
-        },
-    )
-
-    # 2. Guardar la lectura que rompe el umbral (evento relevante)
+    # 1. Insertar la lectura relevante actual (SIEMPRE)
     db.execute(
         text(
             """
@@ -67,7 +42,7 @@ def persist_alert(
         },
     )
 
-    # 3. Obtener device_id para la alerta
+    # 2. Obtener device_id para la alerta
     device_row = db.execute(
         text("SELECT device_id FROM dbo.sensors WHERE id = :sensor_id"),
         {"sensor_id": sensor_id},
@@ -76,42 +51,51 @@ def persist_alert(
         return
     device_id = int(device_row[0])
 
-    # 4. Cerrar alertas activas previas del mismo sensor (1 alerta activa por sensor)
+    # 3. Mantener UNA alerta activa por sensor.
+    #    Si ya existe una activa, se actualiza (timestamp/value/threshold/device).
+    #    Si no existe, se crea.
     db.execute(
         text(
             """
-            UPDATE dbo.alerts
-            SET status = 'resolved',
-                resolved_at = GETDATE()
+            DECLARE @existing_id INT;
+
+            SELECT TOP 1 @existing_id = id
+            FROM dbo.alerts
             WHERE sensor_id = :sensor_id
               AND status = 'active'
-            """
-        ),
-        {"sensor_id": sensor_id},
-    )
+            ORDER BY triggered_at DESC;
 
-    # 5. Crear nueva alerta activa (severity siempre = critical)
-    db.execute(
-        text(
-            """
-            INSERT INTO dbo.alerts (
-                threshold_id,
-                sensor_id,
-                device_id,
-                severity,
-                status,
-                triggered_value,
-                triggered_at
-            )
-            VALUES (
-                :threshold_id,
-                :sensor_id,
-                :device_id,
-                'critical',
-                'active',
-                :value,
-                :ts
-            )
+            IF @existing_id IS NULL
+            BEGIN
+                INSERT INTO dbo.alerts (
+                    threshold_id,
+                    sensor_id,
+                    device_id,
+                    severity,
+                    status,
+                    triggered_value,
+                    triggered_at
+                )
+                VALUES (
+                    :threshold_id,
+                    :sensor_id,
+                    :device_id,
+                    'critical',
+                    'active',
+                    :value,
+                    :ts
+                );
+            END
+            ELSE
+            BEGIN
+                UPDATE dbo.alerts
+                SET threshold_id = :threshold_id,
+                    device_id = :device_id,
+                    severity = 'critical',
+                    triggered_value = :value,
+                    triggered_at = :ts
+                WHERE id = @existing_id;
+            END
             """
         ),
         {
