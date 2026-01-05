@@ -33,6 +33,8 @@ app = FastAPI(title="IoT Ingest Service", version="0.3.0")
 
 def _log_db_identity(db: Session) -> None:
     logger = logging.getLogger(__name__)
+    if os.getenv("INGEST_DEBUG_DB_IDENTITY", "").strip() != "1":
+        return
     try:
         row = (
             db.execute(

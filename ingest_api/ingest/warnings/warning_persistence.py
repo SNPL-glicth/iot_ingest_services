@@ -25,6 +25,30 @@ def persist_warning(
     - Cierra advertencias activas previas del mismo sensor (1 advertencia activa por sensor)
     - Crea nuevo evento ML de tipo DELTA_SPIKE
     """
+    db.execute(
+        text(
+            """
+            MERGE dbo.sensor_readings_latest AS tgt
+            USING (
+                SELECT :sensor_id AS sensor_id, :value AS latest_value, :ts AS latest_timestamp
+            ) AS src
+                ON tgt.sensor_id = src.sensor_id
+            WHEN MATCHED THEN
+                UPDATE SET
+                    tgt.latest_value = src.latest_value,
+                    tgt.latest_timestamp = src.latest_timestamp
+            WHEN NOT MATCHED THEN
+                INSERT (sensor_id, latest_value, latest_timestamp)
+                VALUES (src.sensor_id, src.latest_value, src.latest_timestamp);
+            """
+        ),
+        {
+            "sensor_id": sensor_id,
+            "value": value,
+            "ts": ingest_timestamp,
+        },
+    )
+
     # 1. Insertar la lectura relevante actual (delta spike)
     db.execute(
         text(

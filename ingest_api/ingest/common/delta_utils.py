@@ -126,32 +126,24 @@ def check_delta_spike(
     slope_abs = delta_abs / dt_seconds
     slope_rel = delta_rel / dt_seconds if dt_seconds > 0 else 0.0
 
-    # Verificar umbrales
     triggered = []
     reason_parts = []
 
-    # Regla WARNING: si hay abs_delta configurado, usar delta ENTERO y estrictamente mayor ("supera")
-    # para evitar falsos positivos por decimales mínimos.
-    integer_delta_abs = int(delta_abs)
-    if delta_threshold.abs_delta is not None:
-        integer_threshold = int(delta_threshold.abs_delta)
-        if integer_delta_abs > integer_threshold:
-            triggered.append("abs_delta")
-            reason_parts.append(
-                f"delta_int={integer_delta_abs} > {integer_threshold} (delta_abs={delta_abs:.6f})"
-            )
+    if delta_threshold.abs_delta is not None and delta_abs >= float(delta_threshold.abs_delta):
+        triggered.append("abs_delta")
+        reason_parts.append(f"delta_abs={delta_abs:.6f} >= {float(delta_threshold.abs_delta):.6f}")
 
-    if delta_threshold.abs_delta is None and delta_threshold.rel_delta is not None and delta_rel >= delta_threshold.rel_delta:
+    if delta_threshold.rel_delta is not None and delta_rel >= float(delta_threshold.rel_delta):
         triggered.append("rel_delta")
-        reason_parts.append(f"delta_rel={delta_rel:.4%} >= {delta_threshold.rel_delta:.4%}")
+        reason_parts.append(f"delta_rel={delta_rel:.4%} >= {float(delta_threshold.rel_delta):.4%}")
 
-    if delta_threshold.abs_delta is None and delta_threshold.abs_slope is not None and slope_abs >= delta_threshold.abs_slope:
+    if delta_threshold.abs_slope is not None and slope_abs >= float(delta_threshold.abs_slope):
         triggered.append("abs_slope")
-        reason_parts.append(f"slope_abs={slope_abs:.4f} >= {delta_threshold.abs_slope:.4f}")
+        reason_parts.append(f"slope_abs={slope_abs:.6f} >= {float(delta_threshold.abs_slope):.6f}")
 
-    if delta_threshold.abs_delta is None and delta_threshold.rel_slope is not None and slope_rel >= delta_threshold.rel_slope:
+    if delta_threshold.rel_slope is not None and slope_rel >= float(delta_threshold.rel_slope):
         triggered.append("rel_slope")
-        reason_parts.append(f"slope_rel={slope_rel:.4f} >= {delta_threshold.rel_slope:.4f}")
+        reason_parts.append(f"slope_rel={slope_rel:.6f} >= {float(delta_threshold.rel_slope):.6f}")
 
     if not triggered:
         return None
@@ -159,7 +151,6 @@ def check_delta_spike(
     return {
         "is_spike": True,
         "delta_abs": delta_abs,
-        "delta_int": integer_delta_abs,
         "delta_rel": delta_rel,
         "slope_abs": slope_abs,
         "slope_rel": slope_rel,
