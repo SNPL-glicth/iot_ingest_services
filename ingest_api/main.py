@@ -15,6 +15,10 @@ from iot_ingest_services.common.db import get_db
 from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
 from iot_ingest_services.ml_service.in_memory_broker import InMemoryReadingBroker
 from .ingest.router import ReadingRouter
+from .device_auth import (
+    require_device_key_dependency,
+    validate_device_access,
+)
 from .schemas import (
     BulkSensorReadingsIn,
     DevicePacketIn,
@@ -508,21 +512,31 @@ def ingest_readings_bulk(
 
 
 # Recommended endpoint: device packet with multiple sensor readings using UUIDs.
-@app.post("/ingest/packets", response_model=PacketIngestResult, dependencies=[Depends(_require_api_key)])
+@app.post("/ingest/packets", response_model=PacketIngestResult)
 def ingest_packet(
     payload: DevicePacketIn,
     db: Session = Depends(get_db),
+    device_key: str | None = Depends(require_device_key_dependency),
     x_debug_force_persist: str | None = Header(default=None, alias="X-Debug-Force-Persist"),
 ):
     """Endpoint recomendado: ingesta de paquete por dispositivo usando UUIDs.
 
-    Usa la nueva arquitectura de clasificación por propósito:
+    AUTENTICACIÓN:
+    - Nuevo modo: X-Device-Key (API key única por dispositivo)
+    - Legacy: X-API-Key (global, si DEVICE_AUTH_ENABLED != 1)
+
+    FLUJO:
+    - Valida que la API key pertenece al device_uuid
     - Clasifica cada lectura ANTES de persistir
     - Enruta a flujos separados (alert/warning/prediction)
     - Solo publica datos limpios en el broker ML
+    - Actualiza last_seen_at del dispositivo
     """
     if not payload.readings:
         return PacketIngestResult(inserted=0, unknown_sensors=[])
+
+    # Validar acceso del dispositivo (si device_key está presente)
+    validate_device_access(db, str(payload.device_uuid), device_key)
 
     unknown: list[UUID] = []
     rows: list[dict] = []

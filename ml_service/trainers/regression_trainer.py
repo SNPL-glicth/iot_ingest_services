@@ -79,3 +79,59 @@ def predict_future_value(model: RegressionModel, last_minutes: float) -> float:
     t_future = last_minutes + model.horizon_minutes
     y_hat = model.intercept_ + model.coef_ * t_future
     return float(y_hat)
+
+
+def predict_future_value_clamped(
+    model: RegressionModel,
+    last_minutes: float,
+    last_value: float,
+    series_min: float,
+    series_max: float,
+    max_change_ratio: float = 0.5,
+) -> float:
+    """FIX 2: Predice el próximo valor con clamp para evitar predicciones extremas.
+    
+    Limita la predicción para que no exceda un porcentaje máximo de cambio
+    respecto al último valor conocido, y que no salga del rango histórico
+    expandido por un margen de seguridad.
+    
+    Args:
+        model: Modelo de regresión entrenado
+        last_minutes: Minutos del último punto en la serie
+        last_value: Último valor conocido del sensor
+        series_min: Valor mínimo en la serie de entrenamiento
+        series_max: Valor máximo en la serie de entrenamiento
+        max_change_ratio: Máximo cambio permitido como ratio (0.5 = 50%)
+    
+    Returns:
+        Valor predicho con clamp aplicado
+    """
+    # Predicción raw
+    y_raw = predict_future_value(model, last_minutes)
+    
+    # Calcular límites basados en cambio máximo permitido
+    max_delta = abs(last_value) * max_change_ratio
+    if max_delta < 1.0:
+        max_delta = 1.0  # Mínimo absoluto para valores cercanos a 0
+    
+    change_min = last_value - max_delta
+    change_max = last_value + max_delta
+    
+    # Calcular límites basados en rango histórico con margen
+    range_span = series_max - series_min
+    margin = range_span * 0.25 if range_span > 0 else 1.0
+    range_min = series_min - margin
+    range_max = series_max + margin
+    
+    # Aplicar el límite más restrictivo
+    clamp_min = max(change_min, range_min)
+    clamp_max = min(change_max, range_max)
+    
+    # Asegurar que clamp_min <= clamp_max
+    if clamp_min > clamp_max:
+        clamp_min, clamp_max = clamp_max, clamp_min
+    
+    # Clamp final
+    y_clamped = max(clamp_min, min(y_raw, clamp_max))
+    
+    return float(y_clamped)

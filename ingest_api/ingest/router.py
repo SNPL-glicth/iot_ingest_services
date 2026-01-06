@@ -16,6 +16,7 @@ from iot_ingest_services.ml_service.reading_broker import ReadingBroker
 
 from .common.physical_ranges import get_physical_range
 from .common.delta_utils import get_delta_threshold, get_last_reading, get_last_clean_reading, check_delta_spike
+from .common.validation import is_suspicious_zero_reading, log_suspicious_reading
 from .alerts.alert_ingest import AlertIngestPipeline
 from .warnings.warning_ingest import WarningIngestPipeline
 from .predictions.prediction_ingest import PredictionIngestPipeline
@@ -65,6 +66,11 @@ class ReadingRouter:
         """
         if ingest_timestamp is None:
             ingest_timestamp = datetime.now(timezone.utc)
+
+        # FIX 1: Detectar lecturas sospechosas con valor 0.00000
+        # No las rechazamos, pero las registramos para análisis
+        if is_suspicious_zero_reading(value):
+            log_suspicious_reading(sensor_id, value, reason="exact_zero_value")
 
         # 1. Verificar violación de rango físico (ALERT pipeline)
         physical_range = get_physical_range(self._db, sensor_id)

@@ -30,6 +30,7 @@ from iot_ingest_services.ml_service.repository.sensor_repository import (
 from iot_ingest_services.ml_service.trainers.regression_trainer import (
     train_regression_for_sensor,
     predict_future_value,
+    predict_future_value_clamped,
 )
 from iot_ingest_services.ml_service.trainers.isolation_trainer import IsolationForestTrainer
 
@@ -669,8 +670,19 @@ def _process_sensor(
         anomaly_score = 0.0
         window_points_effective = len(series.values)
     else:
-        # Predicción N minutos adelante
-        predicted_value = predict_future_value(reg_model, last_minutes)
+        # FIX 2: Predicción N minutos adelante con clamp para evitar valores extremos
+        series_min = float(min(series.values))
+        series_max = float(max(series.values))
+        last_value = float(series.values[-1])
+        
+        predicted_value = predict_future_value_clamped(
+            reg_model,
+            last_minutes,
+            last_value=last_value,
+            series_min=series_min,
+            series_max=series_max,
+            max_change_ratio=0.5,  # Máximo 50% de cambio
+        )
         trend = compute_trend(reg_model.coef_)
 
         # Residuales históricos para IsolationForest
