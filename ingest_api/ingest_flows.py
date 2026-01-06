@@ -15,6 +15,7 @@ Reglas de persistencia:
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -274,6 +275,32 @@ def ingest_prediction(
             "ts": ingest_timestamp,
         },
     )
+
+    # DEV/QA mode: persist full stream for charts/debugging.
+    # By default this remains disabled to avoid massive writes.
+    persist_all = str(os.getenv("INGEST_PERSIST_ALL_READINGS", "false")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    if persist_all:
+        device_ts = classified.device_timestamp
+        db.execute(
+            text(
+                """
+                INSERT INTO dbo.sensor_readings (sensor_id, value, timestamp, device_timestamp)
+                VALUES (:sensor_id, :value, :ts, :device_ts)
+                """
+            ),
+            {
+                "sensor_id": sensor_id,
+                "value": value,
+                "ts": ingest_timestamp,
+                "device_ts": device_ts,
+            },
+        )
 
     # 2. NO guardamos todas las lecturas aquí.
     # El ML online consume desde el broker en memoria (ventanas deslizantes).
