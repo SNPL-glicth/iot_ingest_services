@@ -28,6 +28,7 @@ class LastReading:
     value: float
     timestamp: datetime
     reading_id: Optional[int] = None
+    is_spike: bool = False  # Bug 1.4: Marcar si fue spike para evitar efecto rebote
 
 
 def _to_utc_aware(ts: datetime) -> datetime:
@@ -92,6 +93,53 @@ def get_last_reading(db: Session, sensor_id: int) -> Optional[LastReading]:
     )
 
 
+def get_last_clean_reading(db: Session, sensor_id: int) -> Optional[LastReading]:
+    """Bug 1.4: Obtiene la última lectura LIMPIA (no spike) del sensor.
+    
+    Esto evita el efecto rebote donde un spike anterior hace que la siguiente
+    lectura normal también parezca spike por la diferencia de valores.
+    
+    Busca en sensor_readings las últimas lecturas y filtra las que no tienen
+    un ml_event DELTA_SPIKE asociado en una ventana de 1 minuto.
+    """
+    row = db.execute(
+        text(
+            """
+            SELECT TOP 1
+                r.id AS reading_id,
+                r.value,
+                r.timestamp
+            FROM dbo.sensor_readings r WITH (NOLOCK)
+            WHERE r.sensor_id = :sensor_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM dbo.ml_events e WITH (NOLOCK)
+                  WHERE e.sensor_id = r.sensor_id
+                    AND e.event_code = 'DELTA_SPIKE'
+                    AND e.created_at >= DATEADD(SECOND, -30, r.timestamp)
+                    AND e.created_at <= DATEADD(SECOND, 30, r.timestamp)
+              )
+            ORDER BY r.timestamp DESC
+            """
+        ),
+        {"sensor_id": sensor_id},
+    ).fetchone()
+
+    if not row:
+        # Fallback: si no hay lecturas limpias, usar la última lectura normal
+        return get_last_reading(db, sensor_id)
+
+    return LastReading(
+        value=float(row.value),
+        timestamp=row.timestamp,
+        reading_id=int(row.reading_id) if row.reading_id else None,
+        is_spike=False,
+    )
+
+
+# Bug 3.5: Umbral mínimo de dt para evaluar slope (evita falsos positivos en batch)
+MIN_DT_FOR_SLOPE_SECONDS = 1.0
+
+
 def check_delta_spike(
     current_value: float,
     current_ts: datetime,
@@ -103,8 +151,11 @@ def check_delta_spike(
     Calcula:
     - Delta absoluto: |current - last|
     - Delta relativo: |delta| / |last|
-    - Slope absoluto: |delta| / dt (unidades/segundo)
-    - Slope relativo: (|delta|/|last|) / dt (1/segundo)
+    - Slope absoluto: |delta| / dt (unidades/segundo) - SOLO si dt >= 1s
+    - Slope relativo: (|delta|/|last|) / dt (1/segundo) - SOLO si dt >= 1s
+
+    Bug 3.5: Si dt < 1s, NO se evalúan thresholds de slope para evitar
+    falsos positivos en lecturas batch o muy cercanas.
 
     Returns:
         dict con is_spike=True si se detecta spike, None en caso contrario
@@ -123,12 +174,15 @@ def check_delta_spike(
     if abs(last_reading.value) > 1e-6:
         delta_rel = abs(delta_abs / last_reading.value)
 
-    slope_abs = delta_abs / dt_seconds
-    slope_rel = delta_rel / dt_seconds if dt_seconds > 0 else 0.0
+    # Bug 3.5: Solo calcular slope si dt >= umbral mínimo
+    can_evaluate_slope = dt_seconds >= MIN_DT_FOR_SLOPE_SECONDS
+    slope_abs = (delta_abs / dt_seconds) if can_evaluate_slope else 0.0
+    slope_rel = (delta_rel / dt_seconds) if can_evaluate_slope else 0.0
 
     triggered = []
     reason_parts = []
 
+    # Siempre evaluar delta absoluto y relativo
     if delta_threshold.abs_delta is not None and delta_abs >= float(delta_threshold.abs_delta):
         triggered.append("abs_delta")
         reason_parts.append(f"delta_abs={delta_abs:.6f} >= {float(delta_threshold.abs_delta):.6f}")
@@ -137,13 +191,15 @@ def check_delta_spike(
         triggered.append("rel_delta")
         reason_parts.append(f"delta_rel={delta_rel:.4%} >= {float(delta_threshold.rel_delta):.4%}")
 
-    if delta_threshold.abs_slope is not None and slope_abs >= float(delta_threshold.abs_slope):
-        triggered.append("abs_slope")
-        reason_parts.append(f"slope_abs={slope_abs:.6f} >= {float(delta_threshold.abs_slope):.6f}")
+    # Bug 3.5: Solo evaluar slope si dt >= 1s para evitar falsos positivos
+    if can_evaluate_slope:
+        if delta_threshold.abs_slope is not None and slope_abs >= float(delta_threshold.abs_slope):
+            triggered.append("abs_slope")
+            reason_parts.append(f"slope_abs={slope_abs:.6f} >= {float(delta_threshold.abs_slope):.6f}")
 
-    if delta_threshold.rel_slope is not None and slope_rel >= float(delta_threshold.rel_slope):
-        triggered.append("rel_slope")
-        reason_parts.append(f"slope_rel={slope_rel:.6f} >= {float(delta_threshold.rel_slope):.6f}")
+        if delta_threshold.rel_slope is not None and slope_rel >= float(delta_threshold.rel_slope):
+            triggered.append("rel_slope")
+            reason_parts.append(f"slope_rel={slope_rel:.6f} >= {float(delta_threshold.rel_slope):.6f}")
 
     if not triggered:
         return None
@@ -159,5 +215,6 @@ def check_delta_spike(
         "triggered_thresholds": triggered,
         "severity": delta_threshold.severity,
         "reason": "; ".join(reason_parts),
+        "slope_evaluated": can_evaluate_slope,  # Debug: indica si se evaluó slope
     }
 

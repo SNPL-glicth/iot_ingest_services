@@ -238,18 +238,18 @@ def ingest_prediction(
     classified: ClassifiedReading,
     ingest_timestamp: datetime,
 ) -> None:
-    """Ingesta para ML/PREDICCIÓN (datos limpios).
+    """Ingesta para lecturas NORMALES (sin alerta ni delta spike).
 
-    Solo entran lecturas:
-    - Sin violación física
-    - Sin delta spike fuerte
+    IMPORTANTE: Siempre persistimos en dbo.sensor_readings para que:
+    - La gráfica trading tenga historial real
+    - Se vean fluctuaciones decimales
+    - No haya saltos irreales en la visualización
 
-    Se conservan decimales.
-    El ML NO recibe datos crudos masivos.
-    Se trabajan ventanas cortas en memoria + agregados (1m, 5m, 1h).
+    También actualizamos sensor_readings_latest para estado actual.
     """
     sensor_id = classified.sensor_id
     value = classified.value
+    device_ts = classified.device_timestamp
 
     # 1. Actualizar última lectura (siempre mantener estado actualizado)
     db.execute(
@@ -276,38 +276,20 @@ def ingest_prediction(
         },
     )
 
-    # DEV/QA mode: persist full stream for charts/debugging.
-    # By default this remains disabled to avoid massive writes.
-    persist_all = str(os.getenv("INGEST_PERSIST_ALL_READINGS", "false")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
+    # 2. SIEMPRE persistir en sensor_readings para historial de gráfica.
+    # Esto es necesario para que la gráfica trading muestre el flujo real.
+    db.execute(
+        text(
+            """
+            INSERT INTO dbo.sensor_readings (sensor_id, value, timestamp, device_timestamp)
+            VALUES (:sensor_id, :value, :ts, :device_ts)
+            """
+        ),
+        {
+            "sensor_id": sensor_id,
+            "value": value,
+            "ts": ingest_timestamp,
+            "device_ts": device_ts,
+        },
     )
-    if persist_all:
-        device_ts = classified.device_timestamp
-        db.execute(
-            text(
-                """
-                INSERT INTO dbo.sensor_readings (sensor_id, value, timestamp, device_timestamp)
-                VALUES (:sensor_id, :value, :ts, :device_ts)
-                """
-            ),
-            {
-                "sensor_id": sensor_id,
-                "value": value,
-                "ts": ingest_timestamp,
-                "device_ts": device_ts,
-            },
-        )
-
-    # 2. NO guardamos todas las lecturas aquí.
-    # El ML online consume desde el broker en memoria (ventanas deslizantes).
-    # Solo guardamos agregados periódicos si es necesario (implementación futura).
-    # Por ahora, el broker en memoria es suficiente para ventanas cortas.
-
-    # Nota: La lectura se publicará en el broker para ML online,
-    # pero NO se persiste masivamente en sensor_readings.
-    # Esto reduce la carga en la BD y evita deadlocks.
 

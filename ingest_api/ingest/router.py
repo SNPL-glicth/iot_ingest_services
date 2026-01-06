@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from iot_ingest_services.ml_service.reading_broker import ReadingBroker
 
 from .common.physical_ranges import get_physical_range
-from .common.delta_utils import get_delta_threshold, get_last_reading, check_delta_spike
+from .common.delta_utils import get_delta_threshold, get_last_reading, get_last_clean_reading, check_delta_spike
 from .alerts.alert_ingest import AlertIngestPipeline
 from .warnings.warning_ingest import WarningIngestPipeline
 from .predictions.prediction_ingest import PredictionIngestPipeline
@@ -104,7 +104,9 @@ class ReadingRouter:
             return PipelineType.ALERT
 
         # 2. Verificar delta spike (WARNING pipeline)
-        last_reading = get_last_reading(self._db, sensor_id)
+        # Bug 1.4: Usar get_last_clean_reading para evitar efecto rebote
+        # donde un spike anterior hace que la siguiente lectura normal parezca spike
+        last_reading = get_last_clean_reading(self._db, sensor_id)
         if last_reading:
             delta_threshold = get_delta_threshold(self._db, sensor_id)
             if delta_threshold:
