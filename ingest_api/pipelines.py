@@ -20,10 +20,29 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from sqlalchemy import text
+
 from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
 from .classification import ReadingClassifier, ReadingClass, ClassifiedReading
 from .ingest_flows import ingest_alert, ingest_warning, ingest_prediction
 from .ingest.predictions.prediction_dispatch import should_skip_prediction
+
+
+def get_sensor_type(db: Session, sensor_id: int) -> str:
+    """INC-09: Obtiene el tipo de sensor desde la BD.
+    
+    Retorna 'unknown' si no se encuentra el sensor.
+    """
+    try:
+        row = db.execute(
+            text("SELECT sensor_type FROM dbo.sensors WHERE id = :sensor_id"),
+            {"sensor_id": sensor_id},
+        ).fetchone()
+        if row and row.sensor_type:
+            return str(row.sensor_type)
+    except Exception:
+        pass
+    return "unknown"
 
 
 def classify_reading(
@@ -132,10 +151,12 @@ def handle_prediction_pipeline(
     )
 
     # PREDICTION_PIPELINE: Solo datos limpios van al ML
+    # INC-09: Resolver sensor_type desde BD en lugar de hardcoded "unknown"
+    sensor_type = get_sensor_type(db, sensor_id)
     now_ts = ingest_timestamp.timestamp()
     reading = Reading(
         sensor_id=sensor_id,
-        sensor_type="unknown",  # opcional: resolver desde BD si lo necesitas
+        sensor_type=sensor_type,
         value=float(value),
         timestamp=now_ts,
     )

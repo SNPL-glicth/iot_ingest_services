@@ -17,6 +17,7 @@ from iot_ingest_services.ml_service.reading_broker import ReadingBroker
 from .common.physical_ranges import get_physical_range
 from .common.delta_utils import get_delta_threshold, get_last_reading, get_last_clean_reading, check_delta_spike
 from .common.validation import is_suspicious_zero_reading, log_suspicious_reading
+from .common.guards import guard_reading, ValidationResult
 from .alerts.alert_ingest import AlertIngestPipeline
 from .warnings.warning_ingest import WarningIngestPipeline
 from .predictions.prediction_ingest import PredictionIngestPipeline
@@ -66,6 +67,21 @@ class ReadingRouter:
         """
         if ingest_timestamp is None:
             ingest_timestamp = datetime.now(timezone.utc)
+
+        # FASE 3: Guard rail - validación temprana antes de cualquier procesamiento
+        guard_result = guard_reading(
+            sensor_id=sensor_id,
+            value=value,
+            device_timestamp=device_timestamp,
+            sensor_type=None,  # Se resuelve después si es necesario
+        )
+        if not guard_result.is_valid:
+            self._logger.warning(
+                "INGEST REJECTED sensor_id=%s value=%s reason=%s details=%s",
+                sensor_id, value, guard_result.reason, guard_result.details,
+            )
+            # Retornar PREDICTION como fallback (no procesar pero no fallar)
+            return PipelineType.PREDICTION
 
         # FIX 1: Detectar lecturas sospechosas con valor 0.00000
         # No las rechazamos, pero las registramos para análisis
