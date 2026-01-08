@@ -125,10 +125,14 @@ def _get_device_id_for_sensor(conn: Connection, sensor_id: int) -> int:
 
 
 def _load_recent_values(conn: Connection, sensor_id: int, window: int) -> list[float]:
+    # FIX FASE2: Evitar CAST AS float, mantener precisión DECIMAL(15,5)
+    # FIX FASE4: Filtrar valores inválidos (NaN, Infinity, None)
+    from iot_ingest_services.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
+    
     rows = conn.execute(
         text(
             """
-            SELECT TOP (:limit) CAST(value AS float) AS v
+            SELECT TOP (:limit) [value] AS v
             FROM dbo.sensor_readings
             WHERE sensor_id = :sensor_id
             ORDER BY [timestamp] DESC
@@ -137,7 +141,8 @@ def _load_recent_values(conn: Connection, sensor_id: int, window: int) -> list[f
         {"sensor_id": sensor_id, "limit": window},
     ).fetchall()
 
-    return [float(r[0]) for r in rows]
+    # Filtrar solo valores válidos (no None, no NaN, no Infinity)
+    return [safe_float(r[0]) for r in rows if is_valid_sensor_value(r[0])]
 
 
 def _should_dedupe_event(conn: Connection, *, sensor_id: int, event_code: str, dedupe_minutes: int) -> bool:

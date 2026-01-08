@@ -7,11 +7,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from iot_ingest_services.common.db import get_db
+from .rate_limiter import get_rate_limiter, get_client_ip
 from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
 from iot_ingest_services.ml_service.in_memory_broker import InMemoryReadingBroker
 from .ingest.router import ReadingRouter
@@ -422,6 +423,7 @@ def _resolve_sensor_id(db: Session, device_uuid: UUID, sensor_uuid: UUID) -> int
 @app.post("/ingest/readings", response_model=IngestResult, dependencies=[Depends(_require_api_key)])
 def ingest_reading(
     payload: SensorReadingIn,
+    request: Request,
     db: Session = Depends(get_db),
     x_debug_force_persist: str | None = Header(default=None, alias="X-Debug-Force-Persist"),
 ):
@@ -429,6 +431,13 @@ def ingest_reading(
 
     Usa la nueva arquitectura de clasificación por propósito.
     """
+    # SSOT: Rate limiting antes de cualquier procesamiento
+    limiter = get_rate_limiter()
+    limiter.check_all(
+        sensor_ids=[payload.sensor_id],
+        ip=get_client_ip(request),
+    )
+    
     try:
         device_ts = payload.timestamp
         _ingest_single_reading(
@@ -465,6 +474,7 @@ def ingest_reading(
 @app.post("/ingest/readings/bulk", response_model=IngestResult, dependencies=[Depends(_require_api_key)])
 def ingest_readings_bulk(
     payload: BulkSensorReadingsIn,
+    request: Request,
     db: Session = Depends(get_db),
     x_debug_force_persist: str | None = Header(default=None, alias="X-Debug-Force-Persist"),
 ):
@@ -474,6 +484,14 @@ def ingest_readings_bulk(
     """
     if not payload.readings:
         return IngestResult(inserted=0)
+    
+    # SSOT: Rate limiting antes de cualquier procesamiento
+    limiter = get_rate_limiter()
+    sensor_ids = list(set(r.sensor_id for r in payload.readings))
+    limiter.check_all(
+        sensor_ids=sensor_ids,
+        ip=get_client_ip(request),
+    )
 
     rows = [
         {
@@ -515,6 +533,7 @@ def ingest_readings_bulk(
 @app.post("/ingest/packets", response_model=PacketIngestResult)
 def ingest_packet(
     payload: DevicePacketIn,
+    request: Request,
     db: Session = Depends(get_db),
     device_key: str | None = Depends(require_device_key_dependency),
     x_debug_force_persist: str | None = Header(default=None, alias="X-Debug-Force-Persist"),
@@ -526,6 +545,7 @@ def ingest_packet(
     - Legacy: X-API-Key (global, si DEVICE_AUTH_ENABLED != 1)
 
     FLUJO:
+    - Rate limiting por IP y dispositivo
     - Valida que la API key pertenece al device_uuid
     - Clasifica cada lectura ANTES de persistir
     - Enruta a flujos separados (alert/warning/prediction)
@@ -534,6 +554,13 @@ def ingest_packet(
     """
     if not payload.readings:
         return PacketIngestResult(inserted=0, unknown_sensors=[])
+
+    # SSOT: Rate limiting antes de cualquier procesamiento
+    limiter = get_rate_limiter()
+    limiter.check_all(
+        device_uuid=str(payload.device_uuid),
+        ip=get_client_ip(request),
+    )
 
     # Validar acceso del dispositivo (si device_key está presente)
     validate_device_access(db, str(payload.device_uuid), device_key)

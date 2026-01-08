@@ -37,10 +37,11 @@ def load_sensor_series(
     sensor_id: int,
     limit_points: int,
 ) -> SensorSeries:
+    # FIX FASE2: Evitar CAST AS float, mantener precisión DECIMAL(15,5)
     rows = conn.execute(
         text(
             """
-            SELECT TOP (:limit) [timestamp], CAST(value AS float) AS v
+            SELECT TOP (:limit) [timestamp], [value] AS v
             FROM dbo.sensor_readings
             WHERE sensor_id = :sensor_id
             ORDER BY [timestamp] ASC
@@ -53,7 +54,8 @@ def load_sensor_series(
     vals: list[float] = []
     for t, v in rows:
         ts.append(t)
-        vals.append(float(v))
+        # Python Decimal → float mantiene mejor precisión que SQL CAST
+        vals.append(float(v) if v is not None else 0.0)
 
     return SensorSeries(sensor_id=sensor_id, timestamps=ts, values=vals)
 
