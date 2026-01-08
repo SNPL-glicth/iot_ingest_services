@@ -16,6 +16,7 @@ Reglas críticas:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -24,6 +25,9 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
+
+# FIX FASE2: Importar funciones canónicas de precisión
+from iot_ingest_services.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
 
 
 class ReadingClass(Enum):
@@ -112,6 +116,16 @@ class ReadingClassifier:
         if ingest_timestamp is None:
             ingest_timestamp = datetime.now(timezone.utc)
 
+        # FIX FASE2: Validación NaN/Infinity antes de procesar
+        if not is_valid_sensor_value(value):
+            return ClassifiedReading(
+                sensor_id=sensor_id,
+                value=safe_float(value, 0.0),
+                device_timestamp=device_timestamp,
+                classification=ReadingClass.ML_PREDICTION,
+                reason=f"Valor inválido (NaN/Infinity/None): {value} - descartado",
+            )
+
         # 1. Verificar violación de rango físico (hard rule)
         physical_range = self._get_physical_range(sensor_id)
         if physical_range and self._violates_physical_range(value, physical_range):
@@ -182,8 +196,9 @@ class ReadingClassifier:
             self._range_cache[sensor_id] = None
             return None
 
-        min_val = float(row.threshold_value_min) if row.threshold_value_min is not None else None
-        max_val = float(row.threshold_value_max) if row.threshold_value_max is not None else None
+        # FIX FASE2: Usar safe_float en lugar de float() directo
+        min_val = safe_float(row.threshold_value_min, None) if row.threshold_value_min is not None else None
+        max_val = safe_float(row.threshold_value_max, None) if row.threshold_value_max is not None else None
 
         if min_val is None and max_val is None:
             self._range_cache[sensor_id] = None
@@ -232,11 +247,12 @@ class ReadingClassifier:
             self._delta_cache[sensor_id] = None
             return None
 
+        # FIX FASE2: Usar safe_float en lugar de float() directo
         delta_threshold = DeltaThreshold(
-            abs_delta=float(row.abs_delta) if row.abs_delta is not None else None,
-            rel_delta=float(row.rel_delta) if row.rel_delta is not None else None,
-            abs_slope=float(row.abs_slope) if row.abs_slope is not None else None,
-            rel_slope=float(row.rel_slope) if row.rel_slope is not None else None,
+            abs_delta=safe_float(row.abs_delta, None) if row.abs_delta is not None else None,
+            rel_delta=safe_float(row.rel_delta, None) if row.rel_delta is not None else None,
+            abs_slope=safe_float(row.abs_slope, None) if row.abs_slope is not None else None,
+            rel_slope=safe_float(row.rel_slope, None) if row.rel_slope is not None else None,
             severity=str(row.severity or "warning"),
         )
         self._delta_cache[sensor_id] = delta_threshold
@@ -264,8 +280,14 @@ class ReadingClassifier:
             self._last_reading_cache[sensor_id] = None
             return None
 
+        # FIX FASE2: Usar safe_float con validación NaN
+        latest_val = safe_float(row.latest_value, None)
+        if latest_val is None:
+            self._last_reading_cache[sensor_id] = None
+            return None
+        
         last_reading = LastReading(
-            value=float(row.latest_value),
+            value=latest_val,
             timestamp=row.latest_timestamp,
         )
         self._last_reading_cache[sensor_id] = last_reading

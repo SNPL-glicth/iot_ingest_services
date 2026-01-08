@@ -612,10 +612,11 @@ class SimpleMlOnlineProcessor:
         reading_dt = datetime.fromtimestamp(float(reading.timestamp), tz=timezone.utc)
 
         with engine.connect() as conn:  # type: ignore[call-arg]
+            # FIX PUNTO 2.3: Eliminar CAST AS float, mantener precisión DECIMAL(15,5)
             row = conn.execute(
                 text(
                     """
-                    SELECT TOP 1 id, CAST(predicted_value AS float) AS v, target_timestamp
+                    SELECT TOP 1 id, [predicted_value], target_timestamp
                     FROM dbo.predictions
                     WHERE sensor_id = :sensor_id
                       AND ABS(DATEDIFF(second, target_timestamp, :ts)) <= :tol
@@ -633,7 +634,8 @@ class SimpleMlOnlineProcessor:
                 return
 
             prediction_id, predicted_value, _target_ts = row
-            predicted_value_f = float(predicted_value)
+            # Python Decimal → float mantiene mejor precisión que SQL CAST
+            predicted_value_f = float(predicted_value) if predicted_value is not None else 0.0
 
             error_abs = abs(float(reading.value) - predicted_value_f)
             denom = max(abs(predicted_value_f), 1e-6)

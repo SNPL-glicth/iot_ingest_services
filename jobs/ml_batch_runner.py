@@ -63,10 +63,11 @@ def _get_sensor_max_reading_id(conn, sensor_id: int) -> int | None:
 
 
 def _load_recent_values(conn, sensor_id: int, window: int) -> list[float]:
+    # FIX PUNTO 2.3: Eliminar CAST AS float, mantener precisión DECIMAL(15,5)
     rows = conn.execute(
         text(
             """
-            SELECT TOP (:limit) CAST(value AS float) AS v
+            SELECT TOP (:limit) [value]
             FROM dbo.sensor_readings
             WHERE sensor_id = :sensor_id
             ORDER BY [timestamp] DESC
@@ -75,7 +76,8 @@ def _load_recent_values(conn, sensor_id: int, window: int) -> list[float]:
         {"sensor_id": sensor_id, "limit": window},
     ).fetchall()
 
-    return [float(r[0]) for r in rows]
+    # Python Decimal → float mantiene mejor precisión que SQL CAST
+    return [float(r[0]) if r[0] is not None else 0.0 for r in rows]
 
 
 def _get_device_id_for_sensor(conn, sensor_id: int) -> int:
