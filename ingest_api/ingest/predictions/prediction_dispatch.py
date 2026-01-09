@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
 
@@ -9,6 +10,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
+
+# FIX AUDITORIA: Logger para diagnóstico de dedupe
+_logger = logging.getLogger(__name__)
 
 
 def _to_decimal(value: float) -> Decimal | None:
@@ -39,19 +43,38 @@ def should_skip_prediction(
     sensor_id: int,
     value: float,
 ) -> tuple[bool, str]:
+    """Determina si se debe omitir la predicción por dedupe.
+    
+    FIX AUDITORIA: Logging mejorado para diagnóstico de problema 3.
+    """
     latest = get_latest_value(db, sensor_id)
     if latest is None:
+        _logger.debug(
+            "PREDICTION DEDUPE sensor_id=%s value=%s result=PROCESS reason=no_latest",
+            sensor_id, value,
+        )
         return False, "no_latest"
 
     a = _to_decimal(value)
     b = _to_decimal(latest)
     if a is None or b is None:
-        # Fallback defensivo: no filtrar si no podemos comparar con seguridad
+        _logger.warning(
+            "PREDICTION DEDUPE sensor_id=%s value=%s latest=%s result=PROCESS reason=bad_decimal",
+            sensor_id, value, latest,
+        )
         return False, "bad_decimal"
 
     if a == b:
+        _logger.debug(
+            "PREDICTION DEDUPE sensor_id=%s value=%s latest=%s result=SKIP reason=same_as_latest",
+            sensor_id, value, latest,
+        )
         return True, "same_as_latest"
 
+    _logger.debug(
+        "PREDICTION DEDUPE sensor_id=%s value=%s latest=%s delta=%s result=PROCESS reason=changed",
+        sensor_id, value, latest, float(a - b),
+    )
     return False, "changed"
 
 
