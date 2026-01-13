@@ -30,6 +30,16 @@ from sqlalchemy.orm import Session
 from iot_ingest_services.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
 
 
+@dataclass
+class CanonicalThresholds:
+    """Umbrales canónicos WARNING/ALERT para subordinar semántica de delta spike."""
+
+    warning_min: Optional[float] = None
+    warning_max: Optional[float] = None
+    alert_min: Optional[float] = None
+    alert_max: Optional[float] = None
+
+
 class ReadingClass(Enum):
     """Clasificación de una lectura según su propósito."""
 
@@ -89,6 +99,75 @@ class ReadingClassifier:
         self._range_cache: dict[int, Optional[PhysicalRange]] = {}
         self._delta_cache: dict[int, Optional[DeltaThreshold]] = {}
         self._last_reading_cache: dict[int, Optional[LastReading]] = {}
+        self._thresholds_cache: dict[int, Optional[CanonicalThresholds]] = {}
+
+    def _get_canonical_thresholds(self, sensor_id: int) -> Optional[CanonicalThresholds]:
+        """Obtiene umbrales WARNING/ALERT (min/max) desde alert_thresholds.
+
+        Nota: Se usan solo para subordinar delta spikes al rango WARNING.
+        """
+        if sensor_id in self._thresholds_cache:
+            return self._thresholds_cache[sensor_id]
+
+        rows = self._db.execute(
+            text(
+                """
+                SELECT
+                    severity,
+                    threshold_value_min,
+                    threshold_value_max
+                FROM dbo.alert_thresholds
+                WHERE sensor_id = :sensor_id
+                  AND is_active = 1
+                  AND condition_type = 'out_of_range'
+                  AND severity IN ('warning', 'critical')
+                ORDER BY CASE severity WHEN 'critical' THEN 0 ELSE 1 END, id ASC
+                """
+            ),
+            {"sensor_id": sensor_id},
+        ).fetchall()
+
+        if not rows:
+            self._thresholds_cache[sensor_id] = None
+            return None
+
+        warning_min: Optional[float] = None
+        warning_max: Optional[float] = None
+        alert_min: Optional[float] = None
+        alert_max: Optional[float] = None
+
+        for r in rows:
+            sev = str(getattr(r, "severity", "") or "").lower()
+            min_v = safe_float(getattr(r, "threshold_value_min", None), None)
+            max_v = safe_float(getattr(r, "threshold_value_max", None), None)
+            if sev == "warning" and warning_min is None and warning_max is None:
+                warning_min, warning_max = min_v, max_v
+            elif sev == "critical" and alert_min is None and alert_max is None:
+                alert_min, alert_max = min_v, max_v
+
+        th = CanonicalThresholds(
+            warning_min=warning_min,
+            warning_max=warning_max,
+            alert_min=alert_min,
+            alert_max=alert_max,
+        )
+        self._thresholds_cache[sensor_id] = th
+        return th
+
+    def _is_within_warning_band(self, value: float, th: Optional[CanonicalThresholds]) -> bool:
+        if th is None:
+            return False
+
+        if th.warning_min is not None and value < th.warning_min:
+            return False
+        if th.warning_max is not None and value > th.warning_max:
+            return False
+
+        # Si no hay límites configurados, no podemos afirmar que está dentro del rango.
+        if th.warning_min is None and th.warning_max is None:
+            return False
+
+        return True
 
     def classify(
         self,
@@ -136,6 +215,18 @@ class ReadingClassifier:
                 classification=ReadingClass.ALERT,
                 physical_range=physical_range,
                 reason=f"Valor {value} fuera de rango físico [{physical_range.min_value}, {physical_range.max_value}]",
+            )
+
+        # Regla semántica: delta spike subordinado a rango WARNING.
+        # Si el valor actual está dentro de [warningMin, warningMax], NO se marca delta spike.
+        thresholds = self._get_canonical_thresholds(sensor_id)
+        if self._is_within_warning_band(value, thresholds):
+            return ClassifiedReading(
+                sensor_id=sensor_id,
+                value=value,
+                device_timestamp=device_timestamp,
+                classification=ReadingClass.ML_PREDICTION,
+                reason="Dato dentro de rango WARNING; delta spike no aplica",
             )
 
         # 2. Verificar delta spike (cambios rápidos)
