@@ -384,6 +384,12 @@ class ReadingClassifier:
         self._last_reading_cache[sensor_id] = last_reading
         return last_reading
 
+    # FIX: Umbral mínimo de ruido para evitar falsos positivos por variaciones normales del sensor.
+    # Los sensores tienen ruido electrónico inherente (~0.01-0.1 dependiendo del tipo).
+    # Cambios por debajo de este umbral NO son spikes, son ruido normal.
+    NOISE_FLOOR_ABS = 0.05  # Mínimo delta absoluto para considerar spike
+    NOISE_FLOOR_REL = 0.005  # Mínimo delta relativo (0.5%) para considerar spike
+
     def _check_delta_spike(
         self,
         sensor_id: int,
@@ -399,6 +405,9 @@ class ReadingClassifier:
         - Slope absoluto: |delta| / dt (unidades/segundo)
         - Slope relativo: (|delta|/|last|) / dt (1/segundo)
 
+        FIX: Aplica un umbral de ruido mínimo para filtrar variaciones normales
+        del sensor (ruido electrónico, micro-variaciones ambientales).
+
         Returns:
             dict con is_spike=True si se detecta spike, None en caso contrario
         """
@@ -411,13 +420,20 @@ class ReadingClassifier:
         delta_abs = abs(current_value - last_reading.value)
         dt_seconds = (current_ts - last_reading.timestamp).total_seconds()
 
-        # Evitar división por cero o dt negativo
-        if dt_seconds <= 0:
-            dt_seconds = 0.001  # 1ms mínimo para cálculos
-
+        # FIX: Filtrar ruido normal del sensor ANTES de cualquier evaluación.
+        # Si el delta está por debajo del umbral de ruido, no es un spike real.
         delta_rel = 0.0
         if abs(last_reading.value) > 1e-6:
             delta_rel = abs(delta_abs / last_reading.value)
+
+        # Condición de ruido: delta muy pequeño en términos absolutos Y relativos
+        is_noise = delta_abs < self.NOISE_FLOOR_ABS and delta_rel < self.NOISE_FLOOR_REL
+        if is_noise:
+            return None  # Variación normal del sensor, no es spike
+
+        # Evitar división por cero o dt negativo
+        if dt_seconds <= 0:
+            dt_seconds = 0.001  # 1ms mínimo para cálculos
 
         slope_abs = delta_abs / dt_seconds
         slope_rel = delta_rel / dt_seconds if dt_seconds > 0 else 0.0

@@ -55,6 +55,11 @@ class DeltaSpikeDetector:
     DEFAULT_Z_THRESHOLD = 3.0  # Desviaciones estándar para considerar spike
     DEFAULT_OSCILLATION_THRESHOLD = 0.7  # Ratio de cambios de signo
     MIN_SAMPLES = 5  # Mínimo de muestras para calcular stats
+    
+    # FIX: Umbral mínimo de ruido para filtrar variaciones normales del sensor.
+    # Cambios por debajo de estos umbrales son ruido electrónico normal, no spikes.
+    NOISE_FLOOR_ABS = 0.05  # Mínimo delta absoluto para considerar spike
+    NOISE_FLOOR_REL = 0.005  # Mínimo delta relativo (0.5%) para considerar spike
 
     def __init__(self, db: Connection):
         self._db = db
@@ -89,6 +94,17 @@ class DeltaSpikeDetector:
 
         if len(recent_values) < self.MIN_SAMPLES:
             # No hay suficientes datos para análisis estadístico
+            return None
+
+        # FIX: Filtrar ruido del sensor ANTES de análisis estadístico.
+        # Variaciones muy pequeñas son ruido electrónico normal, no spikes.
+        last_value = recent_values[-1][0]
+        current_delta = abs(current_value - last_value)
+        delta_rel = current_delta / abs(last_value) if abs(last_value) > 1e-6 else 0.0
+        
+        # Si el delta está por debajo del umbral de ruido, no es un spike real
+        is_noise = current_delta < self.NOISE_FLOOR_ABS and delta_rel < self.NOISE_FLOOR_REL
+        if is_noise:
             return None
 
         # Calcular deltas históricos

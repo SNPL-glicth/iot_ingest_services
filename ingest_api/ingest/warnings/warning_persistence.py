@@ -9,6 +9,51 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 
+def _build_spike_title(delta_info: dict) -> str:
+    """Genera un título explicativo para el evento de delta spike.
+    
+    FIX: Mensaje más claro para el usuario en lugar de título genérico.
+    """
+    severity = delta_info.get("severity", "warning")
+    triggered = delta_info.get("triggered_thresholds", [])
+    
+    if severity == "critical":
+        return "Cambio crítico detectado"
+    elif "abs_delta" in triggered or "rel_delta" in triggered:
+        return "Cambio significativo en valor"
+    elif "abs_slope" in triggered or "rel_slope" in triggered:
+        return "Cambio rápido detectado"
+    else:
+        return "Variación inusual detectada"
+
+
+def _build_spike_message(delta_info: dict) -> str:
+    """Genera un mensaje explicativo para el usuario.
+    
+    FIX: Traduce los datos técnicos a lenguaje comprensible.
+    """
+    parts = []
+    
+    delta_abs = delta_info.get("delta_abs")
+    last_value = delta_info.get("last_value")
+    triggered = delta_info.get("triggered_thresholds", [])
+    
+    if delta_abs is not None and last_value is not None:
+        direction = "subió" if delta_info.get("delta_abs", 0) > 0 else "cambió"
+        parts.append(f"El valor {direction} {delta_abs:.2f} unidades desde {last_value:.2f}")
+    
+    if "abs_slope" in triggered or "rel_slope" in triggered:
+        dt = delta_info.get("dt_seconds", 0)
+        if dt > 0:
+            parts.append(f"en {dt:.0f} segundos")
+    
+    reason = delta_info.get("reason", "")
+    if reason and not parts:
+        return reason
+    
+    return ". ".join(parts) if parts else "Cambio detectado fuera del comportamiento normal."
+
+
 def persist_warning(
     db: Session,
     sensor_id: int,
@@ -145,8 +190,8 @@ def persist_warning(
             "device_id": device_id,
             "sensor_id": sensor_id,
             "event_type": event_type,
-            "title": f"Delta spike detectado en sensor {sensor_id}",
-            "message": delta_info.get("reason", ""),
+            "title": _build_spike_title(delta_info),
+            "message": _build_spike_message(delta_info),
             "ts": ingest_timestamp,
             "payload": json.dumps(payload, ensure_ascii=False),
         },
