@@ -16,6 +16,8 @@ from .rate_limiter import get_rate_limiter, get_client_ip
 from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
 from iot_ingest_services.ml_service.in_memory_broker import InMemoryReadingBroker
 from .ingest.router import ReadingRouter
+from .batch_inserter import BatchInserter, get_batch_inserter, init_batch_inserter, shutdown_batch_inserter
+from iot_ingest_services.common.db import get_engine
 from .device_auth import (
     require_device_key_dependency,
     validate_device_access,
@@ -33,7 +35,32 @@ from .schemas import (
     SensorReadingIn,
 )
 
-app = FastAPI(title="IoT Ingest Service", version="0.3.0")
+app = FastAPI(title="IoT Ingest Service", version="0.4.0")
+
+# FIX FASE 3.3: Inicializar BatchInserter al arrancar la app
+@app.on_event("startup")
+async def startup_event():
+    """Inicializa el BatchInserter para ingesta en lotes."""
+    try:
+        engine = get_engine()
+        init_batch_inserter(
+            engine,
+            buffer_size=int(os.getenv("BATCH_BUFFER_SIZE", "100")),
+            flush_interval=float(os.getenv("BATCH_FLUSH_INTERVAL", "5.0")),
+            max_batch_size=int(os.getenv("BATCH_MAX_SIZE", "500")),
+        )
+        logging.getLogger(__name__).info("BatchInserter inicializado correctamente")
+    except Exception as e:
+        logging.getLogger(__name__).error("Error inicializando BatchInserter: %s", e)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Detiene el BatchInserter y hace flush de datos pendientes."""
+    try:
+        shutdown_batch_inserter()
+        logging.getLogger(__name__).info("BatchInserter detenido correctamente")
+    except Exception as e:
+        logging.getLogger(__name__).error("Error deteniendo BatchInserter: %s", e)
 
 
 def _log_db_identity(db: Session) -> None:

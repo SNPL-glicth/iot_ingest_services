@@ -384,11 +384,51 @@ class ReadingClassifier:
         self._last_reading_cache[sensor_id] = last_reading
         return last_reading
 
-    # FIX: Umbral mínimo de ruido para evitar falsos positivos por variaciones normales del sensor.
-    # Los sensores tienen ruido electrónico inherente (~0.01-0.1 dependiendo del tipo).
-    # Cambios por debajo de este umbral NO son spikes, son ruido normal.
-    NOISE_FLOOR_ABS = 0.05  # Mínimo delta absoluto para considerar spike
-    NOISE_FLOOR_REL = 0.005  # Mínimo delta relativo (0.5%) para considerar spike
+    # FIX CRÍTICO: Umbrales de ruido POR TIPO DE SENSOR
+    # Cada tipo de sensor tiene características de ruido diferentes.
+    # Estructura: (noise_floor_abs, noise_floor_rel)
+    SENSOR_TYPE_NOISE_THRESHOLDS = {
+        'temperature': (0.5, 0.02),    # 0.5°C abs, 2% rel - sensible
+        'humidity': (2.0, 0.03),        # 2% abs, 3% rel - ruido medio
+        'air_quality': (50.0, 0.10),    # 50 ppm abs, 10% rel - ruido alto
+        'voltage': (1.0, 0.05),         # 1V abs, 5% rel - fluctuaciones normales
+        'power': (10.0, 0.10),          # 10W abs, 10% rel - picos normales
+        'pressure': (0.5, 0.005),       # 0.5 hPa abs, 0.5% rel - muy estable
+        'default': (0.1, 0.01),         # Conservador para tipos desconocidos
+    }
+    
+    # Cache de tipos de sensor
+    _sensor_type_cache: dict = {}
+    
+    # Fallback legacy (para compatibilidad)
+    NOISE_FLOOR_ABS = 0.05
+    NOISE_FLOOR_REL = 0.005
+
+    def _get_sensor_type(self, sensor_id: int) -> str:
+        """Obtiene el tipo de sensor desde la BD con cache."""
+        if sensor_id in self._sensor_type_cache:
+            return self._sensor_type_cache[sensor_id]
+        
+        try:
+            row = self._db.execute(
+                text(
+                    """
+                    SELECT sensor_type
+                    FROM dbo.sensors
+                    WHERE id = :sensor_id
+                    """
+                ),
+                {"sensor_id": sensor_id},
+            ).fetchone()
+            
+            sensor_type = 'default'
+            if row and row[0]:
+                sensor_type = str(row[0]).lower().strip()
+            
+            self._sensor_type_cache[sensor_id] = sensor_type
+            return sensor_type
+        except Exception:
+            return 'default'
 
     def _check_delta_spike(
         self,
@@ -405,8 +445,8 @@ class ReadingClassifier:
         - Slope absoluto: |delta| / dt (unidades/segundo)
         - Slope relativo: (|delta|/|last|) / dt (1/segundo)
 
-        FIX: Aplica un umbral de ruido mínimo para filtrar variaciones normales
-        del sensor (ruido electrónico, micro-variaciones ambientales).
+        FIX CRÍTICO: Aplica umbrales de ruido ESPECÍFICOS POR TIPO DE SENSOR.
+        Cada tipo de sensor tiene características de ruido diferentes.
 
         Returns:
             dict con is_spike=True si se detecta spike, None en caso contrario
@@ -416,18 +456,25 @@ class ReadingClassifier:
             # Sin umbrales de delta configurados, no detectamos spikes
             return None
 
+        # FIX CRÍTICO: Obtener umbrales de ruido específicos para el tipo de sensor
+        sensor_type = self._get_sensor_type(sensor_id)
+        noise_abs, noise_rel = self.SENSOR_TYPE_NOISE_THRESHOLDS.get(
+            sensor_type,
+            self.SENSOR_TYPE_NOISE_THRESHOLDS['default']
+        )
+
         # Calcular delta y dt
         delta_abs = abs(current_value - last_reading.value)
         dt_seconds = (current_ts - last_reading.timestamp).total_seconds()
 
-        # FIX: Filtrar ruido normal del sensor ANTES de cualquier evaluación.
-        # Si el delta está por debajo del umbral de ruido, no es un spike real.
+        # Calcular delta relativo
         delta_rel = 0.0
         if abs(last_reading.value) > 1e-6:
             delta_rel = abs(delta_abs / last_reading.value)
 
-        # Condición de ruido: delta muy pequeño en términos absolutos Y relativos
-        is_noise = delta_abs < self.NOISE_FLOOR_ABS and delta_rel < self.NOISE_FLOOR_REL
+        # FIX CRÍTICO: Filtrar ruido usando umbrales específicos del tipo de sensor.
+        # Si el delta está por debajo del umbral de ruido del tipo, no es spike.
+        is_noise = delta_abs < noise_abs and delta_rel < noise_rel
         if is_noise:
             return None  # Variación normal del sensor, no es spike
 

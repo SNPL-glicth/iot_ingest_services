@@ -16,7 +16,7 @@ import math
 import statistics
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -48,7 +48,16 @@ class SensorDeltaStats:
 
 
 class DeltaSpikeDetector:
-    """Detector de spikes usando Z-score sobre ventana móvil."""
+    """Detector de spikes usando Z-score sobre ventana móvil.
+    
+    FIX CRÍTICO: Umbrales de ruido ahora son específicos por tipo de sensor.
+    Cada tipo de sensor tiene características de ruido diferentes:
+    - Temperatura: ruido bajo (~0.1°C), cambios lentos
+    - Humedad: ruido medio (~1%), cambios moderados
+    - Presión: ruido muy bajo (~0.01 hPa), muy estable
+    - Voltaje: ruido alto (~0.5V), fluctuaciones rápidas normales
+    - Potencia: ruido muy alto (~5W), picos normales frecuentes
+    """
 
     # Configuración por defecto
     DEFAULT_WINDOW_SIZE = 20  # Últimas N lecturas para calcular stats
@@ -56,15 +65,69 @@ class DeltaSpikeDetector:
     DEFAULT_OSCILLATION_THRESHOLD = 0.7  # Ratio de cambios de signo
     MIN_SAMPLES = 5  # Mínimo de muestras para calcular stats
     
-    # FIX: Umbral mínimo de ruido para filtrar variaciones normales del sensor.
-    # Cambios por debajo de estos umbrales son ruido electrónico normal, no spikes.
-    NOISE_FLOOR_ABS = 0.05  # Mínimo delta absoluto para considerar spike
-    NOISE_FLOOR_REL = 0.005  # Mínimo delta relativo (0.5%) para considerar spike
+    # FIX CRÍTICO: Umbrales de ruido POR TIPO DE SENSOR
+    # Estructura: (noise_floor_abs, noise_floor_rel, z_threshold_override)
+    # - noise_floor_abs: Mínimo delta absoluto para considerar spike
+    # - noise_floor_rel: Mínimo delta relativo para considerar spike
+    # - z_threshold_override: Z-score específico (None = usar default)
+    SENSOR_TYPE_THRESHOLDS = {
+        # Temperatura: muy sensible, ruido bajo
+        'temperature': (0.5, 0.02, 2.5),      # 0.5°C abs, 2% rel, z=2.5
+        # Humedad: ruido medio, variaciones normales mayores
+        'humidity': (2.0, 0.03, 3.0),          # 2% abs, 3% rel, z=3.0
+        # Calidad de aire: ruido alto, variaciones grandes normales
+        'air_quality': (50.0, 0.10, 3.5),      # 50 ppm abs, 10% rel, z=3.5
+        # Voltaje: fluctuaciones normales frecuentes
+        'voltage': (1.0, 0.05, 4.0),           # 1V abs, 5% rel, z=4.0
+        # Potencia: picos normales muy frecuentes
+        'power': (10.0, 0.10, 4.5),            # 10W abs, 10% rel, z=4.5
+        # Presión: muy estable, ruido muy bajo
+        'pressure': (0.5, 0.005, 2.0),         # 0.5 hPa abs, 0.5% rel, z=2.0
+        # Default para tipos desconocidos (conservador)
+        'default': (0.1, 0.01, 3.0),           # 0.1 abs, 1% rel, z=3.0
+    }
+    
+    # Fallback legacy (para compatibilidad)
+    NOISE_FLOOR_ABS = 0.05
+    NOISE_FLOOR_REL = 0.005
 
     def __init__(self, db: Connection):
         self._db = db
         self._stats_cache: dict[int, SensorDeltaStats] = {}
         self._readings_cache: dict[int, List[Tuple[float, datetime]]] = {}
+
+    def _get_sensor_type(self, sensor_id: int) -> str:
+        """Obtiene el tipo de sensor desde la BD."""
+        try:
+            row = self._db.execute(
+                text(
+                    """
+                    SELECT sensor_type
+                    FROM dbo.sensors
+                    WHERE id = :sensor_id
+                    """
+                ),
+                {"sensor_id": sensor_id},
+            ).fetchone()
+            
+            if row and row[0]:
+                return str(row[0]).lower().strip()
+        except Exception:
+            pass
+        return 'default'
+    
+    def _get_thresholds_for_sensor(self, sensor_id: int) -> Tuple[float, float, float]:
+        """Obtiene umbrales de ruido específicos para el tipo de sensor.
+        
+        Returns:
+            Tuple de (noise_floor_abs, noise_floor_rel, z_threshold)
+        """
+        sensor_type = self._get_sensor_type(sensor_id)
+        thresholds = self.SENSOR_TYPE_THRESHOLDS.get(
+            sensor_type, 
+            self.SENSOR_TYPE_THRESHOLDS['default']
+        )
+        return thresholds
 
     def detect_spike(
         self,
@@ -73,6 +136,7 @@ class DeltaSpikeDetector:
         current_ts: datetime,
         z_threshold: Optional[float] = None,
         oscillation_threshold: Optional[float] = None,
+        sensor_type: Optional[str] = None,
     ) -> Optional[SpikeDetectionResult]:
         """Detecta si el valor actual representa un spike.
 
@@ -80,13 +144,18 @@ class DeltaSpikeDetector:
             sensor_id: ID del sensor
             current_value: Valor actual de la lectura
             current_ts: Timestamp de la lectura actual
-            z_threshold: Umbral de Z-score (default: 3.0)
+            z_threshold: Umbral de Z-score (override, default: según tipo de sensor)
             oscillation_threshold: Umbral de oscilación (default: 0.7)
+            sensor_type: Tipo de sensor (opcional, si no se provee se consulta BD)
 
         Returns:
             SpikeDetectionResult si se detecta spike, None si es normal
         """
-        z_threshold = z_threshold or self.DEFAULT_Z_THRESHOLD
+        # FIX CRÍTICO: Obtener umbrales específicos por tipo de sensor
+        noise_abs, noise_rel, type_z_threshold = self._get_thresholds_for_sensor(sensor_id)
+        
+        # Usar z_threshold del tipo de sensor si no se especifica uno explícito
+        z_threshold = z_threshold or type_z_threshold
         oscillation_threshold = oscillation_threshold or self.DEFAULT_OSCILLATION_THRESHOLD
 
         # Obtener lecturas recientes
@@ -96,14 +165,14 @@ class DeltaSpikeDetector:
             # No hay suficientes datos para análisis estadístico
             return None
 
-        # FIX: Filtrar ruido del sensor ANTES de análisis estadístico.
-        # Variaciones muy pequeñas son ruido electrónico normal, no spikes.
+        # FIX CRÍTICO: Filtrar ruido usando umbrales específicos del tipo de sensor.
+        # Cada tipo de sensor tiene características de ruido diferentes.
         last_value = recent_values[-1][0]
         current_delta = abs(current_value - last_value)
         delta_rel = current_delta / abs(last_value) if abs(last_value) > 1e-6 else 0.0
         
-        # Si el delta está por debajo del umbral de ruido, no es un spike real
-        is_noise = current_delta < self.NOISE_FLOOR_ABS and delta_rel < self.NOISE_FLOOR_REL
+        # Si el delta está por debajo del umbral de ruido del tipo de sensor, no es spike
+        is_noise = current_delta < noise_abs and delta_rel < noise_rel
         if is_noise:
             return None
 
