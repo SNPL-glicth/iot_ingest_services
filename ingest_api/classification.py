@@ -29,6 +29,9 @@ from sqlalchemy.orm import Session
 # FIX FASE2: Importar funciones canónicas de precisión
 from iot_ingest_services.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
 
+# FIX MODELO DE ESTADOS: Importar gestor de estado operacional
+from .sensor_state import SensorStateManager, SensorOperationalState
+
 
 @dataclass
 class CanonicalThresholds:
@@ -91,7 +94,17 @@ class ClassifiedReading:
 
 
 class ReadingClassifier:
-    """Clasificador de lecturas por propósito."""
+    """Clasificador de lecturas por propósito.
+    
+    MODELO DE ESTADOS:
+    Usa SensorStateManager como único punto de decisión para determinar
+    si un sensor puede generar WARNING/ALERT.
+    
+    Regla de dominio:
+    - Sensor en INITIALIZING → NUNCA genera eventos
+    - Sensor en STALE → NUNCA genera eventos
+    - Sensor en NORMAL → puede generar WARNING/ALERT
+    """
 
     def __init__(self, db: Session | Connection) -> None:
         """Inicializa el clasificador con una Session o Connection."""
@@ -100,6 +113,8 @@ class ReadingClassifier:
         self._delta_cache: dict[int, Optional[DeltaThreshold]] = {}
         self._last_reading_cache: dict[int, Optional[LastReading]] = {}
         self._thresholds_cache: dict[int, Optional[CanonicalThresholds]] = {}
+        # FIX MODELO DE ESTADOS: Gestor de estado operacional
+        self._state_manager = SensorStateManager(db)
 
     def _get_canonical_thresholds(self, sensor_id: int) -> Optional[CanonicalThresholds]:
         """Obtiene umbrales WARNING/ALERT (min/max) desde alert_thresholds.
@@ -194,10 +209,14 @@ class ReadingClassifier:
         """Clasifica una lectura según su propósito.
 
         Orden de evaluación:
-        0. Verificar warm-up del sensor (mínimo de lecturas)
-        1. Verificar violación de rango físico → ALERT
-        2. Verificar delta spike → WARNING
+        0. MODELO DE ESTADOS: Verificar si sensor puede generar eventos
+        1. Verificar violación de rango físico → ALERT (solo si estado permite)
+        2. Verificar delta spike → WARNING (solo si estado permite)
         3. Resto → ML_PREDICTION (dato limpio)
+
+        REGLA DE DOMINIO CRÍTICA:
+        El sensor DEBE estar en estado NORMAL antes de poder generar WARNING/ALERT.
+        Sensores en INITIALIZING o STALE NUNCA generan eventos.
 
         Args:
             sensor_id: ID del sensor
@@ -221,7 +240,33 @@ class ReadingClassifier:
                 reason=f"Valor inválido (NaN/Infinity/None): {value} - descartado",
             )
 
-        # 1. Verificar violación de rango físico (hard rule)
+        # =====================================================================
+        # PASO 0: MODELO DE ESTADOS - Verificar si sensor puede generar eventos
+        # =====================================================================
+        # Esta es la ÚNICA fuente de verdad para decidir si se pueden generar
+        # WARNING/ALERT. Bloquea TOTALMENTE eventos mientras no esté en NORMAL.
+        
+        # Registrar lectura válida (incrementa contador de warm-up si aplica)
+        state_info = self._state_manager.register_valid_reading(sensor_id)
+        
+        # Verificar si puede generar eventos
+        can_generate, state_reason = self._state_manager.can_generate_events(sensor_id)
+        
+        if not can_generate:
+            # Sensor NO puede generar eventos (INITIALIZING, STALE, UNKNOWN)
+            # Retornar ML_PREDICTION sin evaluar umbrales
+            return ClassifiedReading(
+                sensor_id=sensor_id,
+                value=value,
+                device_timestamp=device_timestamp,
+                classification=ReadingClass.ML_PREDICTION,
+                reason=f"Sensor bloqueado para eventos: {state_reason}",
+            )
+
+        # =====================================================================
+        # PASO 1: Verificar violación de rango físico (hard rule)
+        # =====================================================================
+        # Solo se evalúa si el sensor está en estado que permite eventos
         physical_range = self._get_physical_range(sensor_id)
         if physical_range and self._violates_physical_range(value, physical_range):
             # FIX REFACTOR: Enfoque agnóstico basado en lecturas consecutivas
@@ -237,6 +282,9 @@ class ReadingClassifier:
                     classification=ReadingClass.ML_PREDICTION,
                     reason=f"Valor {value} fuera de rango, pero solo {consecutive_count}/{consecutive_required} lecturas consecutivas",
                 )
+            
+            # Transicionar estado del sensor a ALERT
+            self._state_manager.transition_to(sensor_id, SensorOperationalState.ALERT)
             
             return ClassifiedReading(
                 sensor_id=sensor_id,
@@ -263,25 +311,26 @@ class ReadingClassifier:
                 reason="Dato dentro de rango WARNING; delta spike no aplica",
             )
 
-        # 2. Verificar delta spike (cambios rápidos)
-        # FIX RAÍZ DEFINITIVO: Sin historial válido → NUNCA existe advertencia ni delta spike
-        # Una primera lectura NO tiene contexto histórico válido para evaluar delta spike
+        # =====================================================================
+        # PASO 2: Verificar delta spike (cambios rápidos)
+        # =====================================================================
+        # NOTA: El warm-up ya fue validado por SensorStateManager en PASO 0.
+        # Si llegamos aquí, el sensor está en estado NORMAL y puede generar eventos.
         
-        # PASO 2.1: Obtener última lectura
+        # Obtener última lectura para comparación de delta
         last_reading = self._get_last_reading(sensor_id)
         
-        # REGLA DE DOMINIO CRÍTICA: Sin historial → NO hay delta spike posible
+        # Sin historial reciente → no hay delta spike posible (dato limpio)
         if not last_reading:
             return ClassifiedReading(
                 sensor_id=sensor_id,
                 value=value,
                 device_timestamp=device_timestamp,
                 classification=ReadingClass.ML_PREDICTION,
-                reason="Primera lectura del sensor, sin historial para evaluar delta spike",
+                reason="Sin historial reciente para evaluar delta spike",
             )
         
-        # PASO 2.2: Validar que el historial sea RECIENTE (máximo 10 minutos)
-        # Si last_reading es viejo (ej: de hace días), NO es contexto válido
+        # Validar que el historial sea RECIENTE (máximo 10 minutos)
         last_ts = last_reading.timestamp
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=timezone.utc)
@@ -290,33 +339,18 @@ class ReadingClassifier:
             ingest_ts_utc = ingest_ts_utc.replace(tzinfo=timezone.utc)
         
         last_reading_age_seconds = (ingest_ts_utc - last_ts).total_seconds()
-        max_valid_age_seconds = 600  # 10 minutos máximo para considerar historial válido
+        max_valid_age_seconds = 600  # 10 minutos máximo
         
         if last_reading_age_seconds > max_valid_age_seconds:
-            # Historial demasiado viejo, NO es contexto válido para delta spike
             return ClassifiedReading(
                 sensor_id=sensor_id,
                 value=value,
                 device_timestamp=device_timestamp,
                 classification=ReadingClass.ML_PREDICTION,
-                reason=f"Sin historial válido (última lectura hace {last_reading_age_seconds:.0f}s > {max_valid_age_seconds}s), delta spike no evaluado",
+                reason=f"Historial muy viejo ({last_reading_age_seconds:.0f}s), delta spike no evaluado",
             )
         
-        # PASO 2.3: Verificar warm-up - mínimo de lecturas RECIENTES antes de evaluar delta spike
-        reading_count = self._get_sensor_reading_count(sensor_id)
-        min_readings_for_delta = self.DEFAULT_CONSECUTIVE_READINGS + 1  # Al menos 3 lecturas
-        
-        if reading_count < min_readings_for_delta:
-            # Sensor en warm-up, no evaluar delta spike
-            return ClassifiedReading(
-                sensor_id=sensor_id,
-                value=value,
-                device_timestamp=device_timestamp,
-                classification=ReadingClass.ML_PREDICTION,
-                reason=f"Sensor en warm-up ({reading_count}/{min_readings_for_delta} lecturas), delta spike no evaluado",
-            )
-        
-        # PASO 2.4: Ahora SÍ podemos evaluar delta spike (tenemos historial válido y reciente)
+        # Evaluar delta spike
         delta_info = self._check_delta_spike(
             sensor_id=sensor_id,
             current_value=value,
@@ -333,6 +367,9 @@ class ReadingClassifier:
                     classification=ReadingClass.ML_PREDICTION,
                     reason="Delta spike detectado pero en cooldown, ignorado",
                 )
+            
+            # Transicionar estado del sensor a WARNING
+            self._state_manager.transition_to(sensor_id, SensorOperationalState.WARNING)
             
             return ClassifiedReading(
                 sensor_id=sensor_id,

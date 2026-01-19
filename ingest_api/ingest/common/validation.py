@@ -1,4 +1,14 @@
-"""Validaciones comunes para los pipelines."""
+"""Validaciones comunes para los pipelines.
+
+MODELO DE ESTADOS:
+Todas las validaciones usan SensorStateManager como único punto de decisión
+para determinar si un sensor puede generar WARNING/ALERT.
+
+Regla de dominio:
+- Sensor en INITIALIZING → NUNCA genera eventos
+- Sensor en STALE → NUNCA genera eventos  
+- Sensor en NORMAL → puede generar WARNING/ALERT
+"""
 
 from __future__ import annotations
 
@@ -10,6 +20,9 @@ from sqlalchemy.orm import Session
 
 from .physical_ranges import PhysicalRange, get_physical_range
 from .delta_utils import DeltaThreshold, LastReading, get_delta_threshold, get_last_reading, check_delta_spike
+
+# FIX MODELO DE ESTADOS: Importar gestor de estado operacional
+from iot_ingest_services.ingest_api.sensor_state import SensorStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -121,11 +134,14 @@ def validate_warning_data(
 ) -> tuple[bool, Optional[dict], str]:
     """Valida que los datos pertenezcan al pipeline de WARNINGS.
     
-    FIX RAÍZ DEFINITIVO: Sin historial válido → NUNCA se evalúa delta spike.
+    MODELO DE ESTADOS:
+    Usa SensorStateManager como único punto de decisión.
+    
     Requiere:
+    0. Sensor en estado que permite eventos (NORMAL, WARNING, ALERT)
     1. Lectura previa reciente (máx 10 minutos)
-    2. Mínimo de lecturas en warm-up (al menos 3 en últimas 2 horas)
-    3. Umbrales de delta configurados
+    2. Umbrales de delta configurados
+    3. Delta spike detectado
 
     Returns:
         (is_valid, delta_info, reason)
@@ -135,23 +151,26 @@ def validate_warning_data(
     if current_ts is None:
         current_ts = datetime.now(timezone.utc)
 
+    # =========================================================================
+    # PASO 0: MODELO DE ESTADOS - Verificar si sensor puede generar eventos
+    # =========================================================================
+    state_manager = SensorStateManager(db)
+    can_generate, state_reason = state_manager.can_generate_events(sensor_id)
+    
+    if not can_generate:
+        return False, None, f"Sensor bloqueado para eventos: {state_reason}"
+
     # PASO 1: Verificar que existe lectura previa RECIENTE
-    # get_last_reading() ya valida que sea de los últimos 10 minutos
     last_reading = get_last_reading(db, sensor_id)
     if not last_reading:
-        return False, None, "Sin historial válido (primera lectura o historial muy viejo), delta spike no evaluado"
+        return False, None, "Sin historial reciente para evaluar delta spike"
 
-    # PASO 2: Verificar warm-up - mínimo de lecturas recientes
-    reading_count = _get_recent_reading_count(db, sensor_id)
-    if reading_count < MIN_READINGS_FOR_DELTA:
-        return False, None, f"Sensor en warm-up ({reading_count}/{MIN_READINGS_FOR_DELTA} lecturas), delta spike no evaluado"
-
-    # PASO 3: Verificar umbrales de delta configurados
+    # PASO 2: Verificar umbrales de delta configurados
     delta_threshold = get_delta_threshold(db, sensor_id)
     if not delta_threshold:
         return False, None, "No hay umbrales de delta configurados para este sensor"
 
-    # PASO 4: Ahora SÍ podemos evaluar delta spike
+    # PASO 3: Evaluar delta spike
     delta_info = check_delta_spike(
         current_value=value,
         current_ts=current_ts,
@@ -173,11 +192,13 @@ def validate_prediction_data(
 ) -> tuple[bool, str]:
     """Valida que los datos pertenezcan al pipeline de PREDICCIONES.
 
+    MODELO DE ESTADOS:
+    Si el sensor está en INITIALIZING o STALE, el dato es LIMPIO (no puede
+    haber delta spike sin historial válido).
+
     Los datos de predicción deben estar limpios:
     - Sin violación física
-    - Sin delta spike reciente (SOLO si hay historial válido para evaluarlo)
-    
-    FIX RAÍZ: Sin historial válido → dato es LIMPIO (primera lectura, apta para ML)
+    - Sin delta spike reciente (SOLO si sensor puede generar eventos)
 
     Returns:
         (is_valid, reason)
@@ -189,23 +210,23 @@ def validate_prediction_data(
     if physical_range and physical_range.violates(value):
         return False, f"Valor {value} viola rango físico - debe ir a ALERT pipeline"
 
-    # Verificar delta spike SOLO si hay historial válido
+    # Verificar delta spike SOLO si sensor puede generar eventos
     if current_ts is None:
         current_ts = datetime.now(timezone.utc)
 
-    # get_last_reading() retorna None si no hay historial reciente (últimos 10 min)
+    # MODELO DE ESTADOS: Si sensor no puede generar eventos, dato es limpio
+    state_manager = SensorStateManager(db)
+    can_generate, state_reason = state_manager.can_generate_events(sensor_id)
+    
+    if not can_generate:
+        # Sensor en INITIALIZING/STALE → no puede haber delta spike → dato limpio
+        return True, f"Dato limpio ({state_reason}), apto para ML"
+
+    # Sensor puede generar eventos, verificar delta spike
     last_reading = get_last_reading(db, sensor_id)
     if not last_reading:
-        # Sin historial válido → primera lectura o sensor inactivo → dato limpio
-        return True, "Dato limpio (sin historial para evaluar delta), apto para ML"
-    
-    # Verificar warm-up antes de evaluar delta spike
-    reading_count = _get_recent_reading_count(db, sensor_id)
-    if reading_count < MIN_READINGS_FOR_DELTA:
-        # Sensor en warm-up → no evaluar delta spike → dato limpio
-        return True, f"Dato limpio (sensor en warm-up {reading_count}/{MIN_READINGS_FOR_DELTA}), apto para ML"
+        return True, "Dato limpio (sin historial reciente), apto para ML"
 
-    # Hay historial válido, verificar delta spike
     delta_threshold = get_delta_threshold(db, sensor_id)
     if delta_threshold:
         delta_info = check_delta_spike(
