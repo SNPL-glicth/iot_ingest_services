@@ -69,8 +69,20 @@ def get_delta_threshold(db: Session, sensor_id: int) -> Optional[DeltaThreshold]
     )
 
 
-def get_last_reading(db: Session, sensor_id: int) -> Optional[LastReading]:
-    """Obtiene la última lectura del sensor desde sensor_readings_latest."""
+def get_last_reading(db: Session, sensor_id: int, max_age_seconds: int = 600) -> Optional[LastReading]:
+    """Obtiene la última lectura del sensor desde sensor_readings_latest.
+    
+    FIX CRÍTICO: Solo retorna lectura si es RECIENTE (dentro de max_age_seconds).
+    Sin historial válido → NO existe contexto para evaluar delta spike.
+    
+    Args:
+        db: Sesión de base de datos
+        sensor_id: ID del sensor
+        max_age_seconds: Edad máxima en segundos para considerar válida (default: 600 = 10 min)
+        
+    Returns:
+        LastReading si existe y es reciente, None si no existe o es muy vieja
+    """
     row = db.execute(
         text(
             """
@@ -87,17 +99,36 @@ def get_last_reading(db: Session, sensor_id: int) -> Optional[LastReading]:
     if not row:
         return None
 
+    # FIX RAÍZ: Validar que la lectura sea reciente
+    last_ts = row.latest_timestamp
+    if last_ts is None:
+        return None
+    
+    # Normalizar a UTC para comparación
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=timezone.utc)
+    
+    now_utc = datetime.now(timezone.utc)
+    age_seconds = (now_utc - last_ts).total_seconds()
+    
+    if age_seconds > max_age_seconds:
+        # Lectura demasiado vieja, no es contexto válido
+        return None
+
     return LastReading(
         value=float(row.latest_value),
         timestamp=row.latest_timestamp,
     )
 
 
-def get_last_clean_reading(db: Session, sensor_id: int) -> Optional[LastReading]:
+def get_last_clean_reading(db: Session, sensor_id: int, max_age_seconds: int = 600) -> Optional[LastReading]:
     """Bug 1.4: Obtiene la última lectura LIMPIA (no spike) del sensor.
     
     Esto evita el efecto rebote donde un spike anterior hace que la siguiente
     lectura normal también parezca spike por la diferencia de valores.
+    
+    FIX CRÍTICO: Solo retorna lectura si es RECIENTE (dentro de max_age_seconds).
+    Sin historial válido → NO existe contexto para evaluar delta spike.
     
     Busca en sensor_readings las últimas lecturas y filtra las que no tienen
     un ml_event DELTA_SPIKE asociado en una ventana de 1 minuto.
@@ -111,6 +142,7 @@ def get_last_clean_reading(db: Session, sensor_id: int) -> Optional[LastReading]
                 r.timestamp
             FROM dbo.sensor_readings r WITH (NOLOCK)
             WHERE r.sensor_id = :sensor_id
+              AND r.timestamp >= DATEADD(SECOND, -:max_age, GETUTCDATE())
               AND NOT EXISTS (
                   SELECT 1 FROM dbo.ml_events e WITH (NOLOCK)
                   WHERE e.sensor_id = r.sensor_id
@@ -121,12 +153,12 @@ def get_last_clean_reading(db: Session, sensor_id: int) -> Optional[LastReading]
             ORDER BY r.timestamp DESC
             """
         ),
-        {"sensor_id": sensor_id},
+        {"sensor_id": sensor_id, "max_age": max_age_seconds},
     ).fetchone()
 
     if not row:
-        # Fallback: si no hay lecturas limpias, usar la última lectura normal
-        return get_last_reading(db, sensor_id)
+        # Fallback: si no hay lecturas limpias recientes, usar la última lectura normal (que también valida edad)
+        return get_last_reading(db, sensor_id, max_age_seconds)
 
     return LastReading(
         value=float(row.value),

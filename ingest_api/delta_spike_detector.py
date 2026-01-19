@@ -235,27 +235,35 @@ class DeltaSpikeDetector:
             severity=severity,
         )
 
+    # FIX RAÍZ: Edad máxima de lecturas para considerar historial válido
+    MAX_READING_AGE_SECONDS = 600  # 10 minutos
+    
     def _get_recent_values(
         self, sensor_id: int, window_size: int
     ) -> List[Tuple[float, datetime]]:
-        """Obtiene las últimas N lecturas del sensor."""
+        """Obtiene las últimas N lecturas RECIENTES del sensor.
+        
+        FIX CRÍTICO: Solo retorna lecturas de los últimos 10 minutos.
+        Sin historial válido → NO existe contexto para evaluar delta spike.
+        """
         # Verificar cache
         if sensor_id in self._readings_cache:
             cached = self._readings_cache[sensor_id]
             if len(cached) >= window_size:
                 return cached[-window_size:]
 
-        # Consultar BD
+        # Consultar BD - FIX: Solo lecturas recientes (últimos 10 minutos)
         rows = self._db.execute(
             text(
                 """
                 SELECT TOP (:limit) [value], [timestamp]
                 FROM dbo.sensor_readings
                 WHERE sensor_id = :sensor_id
+                  AND [timestamp] >= DATEADD(SECOND, -:max_age, GETUTCDATE())
                 ORDER BY [timestamp] DESC
                 """
             ),
-            {"sensor_id": sensor_id, "limit": window_size},
+            {"sensor_id": sensor_id, "limit": window_size, "max_age": self.MAX_READING_AGE_SECONDS},
         ).fetchall()
 
         if not rows:

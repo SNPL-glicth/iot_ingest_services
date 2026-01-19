@@ -88,6 +88,31 @@ def validate_alert_data(
     return True, physical_range, f"Valor {value} fuera de rango físico [{physical_range.min_value}, {physical_range.max_value}]"
 
 
+# FIX RAÍZ: Constantes para validación de warm-up
+MIN_READINGS_FOR_DELTA = 3  # Mínimo de lecturas recientes para evaluar delta spike
+WARMUP_WINDOW_HOURS = 2  # Ventana de tiempo para contar lecturas de warm-up
+
+
+def _get_recent_reading_count(db: Session, sensor_id: int, hours: int = WARMUP_WINDOW_HOURS) -> int:
+    """Cuenta lecturas recientes del sensor para validación de warm-up."""
+    from sqlalchemy import text
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT COUNT(*) as cnt
+                FROM dbo.sensor_readings
+                WHERE sensor_id = :sensor_id
+                  AND timestamp >= DATEADD(hour, -:hours, GETDATE())
+                """
+            ),
+            {"sensor_id": sensor_id, "hours": hours},
+        ).fetchone()
+        return int(row[0]) if row and row[0] else 0
+    except Exception:
+        return 0
+
+
 def validate_warning_data(
     db: Session,
     sensor_id: int,
@@ -95,6 +120,12 @@ def validate_warning_data(
     current_ts: Optional[datetime] = None,
 ) -> tuple[bool, Optional[dict], str]:
     """Valida que los datos pertenezcan al pipeline de WARNINGS.
+    
+    FIX RAÍZ DEFINITIVO: Sin historial válido → NUNCA se evalúa delta spike.
+    Requiere:
+    1. Lectura previa reciente (máx 10 minutos)
+    2. Mínimo de lecturas en warm-up (al menos 3 en últimas 2 horas)
+    3. Umbrales de delta configurados
 
     Returns:
         (is_valid, delta_info, reason)
@@ -104,14 +135,23 @@ def validate_warning_data(
     if current_ts is None:
         current_ts = datetime.now(timezone.utc)
 
+    # PASO 1: Verificar que existe lectura previa RECIENTE
+    # get_last_reading() ya valida que sea de los últimos 10 minutos
     last_reading = get_last_reading(db, sensor_id)
     if not last_reading:
-        return False, None, "No hay lectura previa para comparar delta"
+        return False, None, "Sin historial válido (primera lectura o historial muy viejo), delta spike no evaluado"
 
+    # PASO 2: Verificar warm-up - mínimo de lecturas recientes
+    reading_count = _get_recent_reading_count(db, sensor_id)
+    if reading_count < MIN_READINGS_FOR_DELTA:
+        return False, None, f"Sensor en warm-up ({reading_count}/{MIN_READINGS_FOR_DELTA} lecturas), delta spike no evaluado"
+
+    # PASO 3: Verificar umbrales de delta configurados
     delta_threshold = get_delta_threshold(db, sensor_id)
     if not delta_threshold:
         return False, None, "No hay umbrales de delta configurados para este sensor"
 
+    # PASO 4: Ahora SÍ podemos evaluar delta spike
     delta_info = check_delta_spike(
         current_value=value,
         current_ts=current_ts,
@@ -135,7 +175,9 @@ def validate_prediction_data(
 
     Los datos de predicción deben estar limpios:
     - Sin violación física
-    - Sin delta spike reciente
+    - Sin delta spike reciente (SOLO si hay historial válido para evaluarlo)
+    
+    FIX RAÍZ: Sin historial válido → dato es LIMPIO (primera lectura, apta para ML)
 
     Returns:
         (is_valid, reason)
@@ -147,22 +189,33 @@ def validate_prediction_data(
     if physical_range and physical_range.violates(value):
         return False, f"Valor {value} viola rango físico - debe ir a ALERT pipeline"
 
-    # Verificar que NO haya delta spike
+    # Verificar delta spike SOLO si hay historial válido
     if current_ts is None:
         current_ts = datetime.now(timezone.utc)
 
+    # get_last_reading() retorna None si no hay historial reciente (últimos 10 min)
     last_reading = get_last_reading(db, sensor_id)
-    if last_reading:
-        delta_threshold = get_delta_threshold(db, sensor_id)
-        if delta_threshold:
-            delta_info = check_delta_spike(
-                current_value=value,
-                current_ts=current_ts,
-                last_reading=last_reading,
-                delta_threshold=delta_threshold,
-            )
-            if delta_info and delta_info.get("is_spike", False):
-                return False, f"Delta spike detectado - debe ir a WARNING pipeline"
+    if not last_reading:
+        # Sin historial válido → primera lectura o sensor inactivo → dato limpio
+        return True, "Dato limpio (sin historial para evaluar delta), apto para ML"
+    
+    # Verificar warm-up antes de evaluar delta spike
+    reading_count = _get_recent_reading_count(db, sensor_id)
+    if reading_count < MIN_READINGS_FOR_DELTA:
+        # Sensor en warm-up → no evaluar delta spike → dato limpio
+        return True, f"Dato limpio (sensor en warm-up {reading_count}/{MIN_READINGS_FOR_DELTA}), apto para ML"
+
+    # Hay historial válido, verificar delta spike
+    delta_threshold = get_delta_threshold(db, sensor_id)
+    if delta_threshold:
+        delta_info = check_delta_spike(
+            current_value=value,
+            current_ts=current_ts,
+            last_reading=last_reading,
+            delta_threshold=delta_threshold,
+        )
+        if delta_info and delta_info.get("is_spike", False):
+            return False, "Delta spike detectado - debe ir a WARNING pipeline"
 
     return True, "Dato limpio, apto para ML"
 

@@ -169,6 +169,21 @@ class ReadingClassifier:
 
         return True
 
+    # FIX REFACTOR: Configuración de persistencia de estado AGNÓSTICA al tipo de sensor
+    # El sistema NO conoce qué mide el sensor, solo:
+    # - Valores numéricos
+    # - Umbrales definidos
+    # - Reglas temporales
+    #
+    # Regla: Se requieren N lecturas CONSECUTIVAS fuera del umbral para cambiar de estado
+    # Esto es configurable por sensor en la BD (tabla alert_thresholds.consecutive_readings)
+    # Si no está configurado, se usa el default.
+    DEFAULT_CONSECUTIVE_READINGS = 2  # Lecturas consecutivas fuera de umbral para alertar
+    
+    # Cache de estado de lecturas consecutivas por sensor
+    # Estructura: {sensor_id: {'count': int, 'last_state': str, 'last_value': float}}
+    _consecutive_state_cache: dict = {}
+
     def classify(
         self,
         sensor_id: int,
@@ -179,6 +194,7 @@ class ReadingClassifier:
         """Clasifica una lectura según su propósito.
 
         Orden de evaluación:
+        0. Verificar warm-up del sensor (mínimo de lecturas)
         1. Verificar violación de rango físico → ALERT
         2. Verificar delta spike → WARNING
         3. Resto → ML_PREDICTION (dato limpio)
@@ -208,14 +224,32 @@ class ReadingClassifier:
         # 1. Verificar violación de rango físico (hard rule)
         physical_range = self._get_physical_range(sensor_id)
         if physical_range and self._violates_physical_range(value, physical_range):
+            # FIX REFACTOR: Enfoque agnóstico basado en lecturas consecutivas
+            # No alertar hasta que haya N lecturas CONSECUTIVAS fuera de umbral
+            consecutive_required = self._get_consecutive_readings_required(sensor_id)
+            consecutive_count = self._update_consecutive_state(sensor_id, 'ALERT', value)
+            
+            if consecutive_count < consecutive_required:
+                return ClassifiedReading(
+                    sensor_id=sensor_id,
+                    value=value,
+                    device_timestamp=device_timestamp,
+                    classification=ReadingClass.ML_PREDICTION,
+                    reason=f"Valor {value} fuera de rango, pero solo {consecutive_count}/{consecutive_required} lecturas consecutivas",
+                )
+            
             return ClassifiedReading(
                 sensor_id=sensor_id,
                 value=value,
                 device_timestamp=device_timestamp,
                 classification=ReadingClass.ALERT,
                 physical_range=physical_range,
-                reason=f"Valor {value} fuera de rango físico [{physical_range.min_value}, {physical_range.max_value}]",
+                reason=f"Valor {value} fuera de rango físico [{physical_range.min_value}, {physical_range.max_value}] ({consecutive_count} lecturas consecutivas)",
             )
+
+        # FIX REFACTOR: Si el valor está dentro del rango, resetear contador de consecutivos
+        # Esto es crítico para el enfoque agnóstico: el estado se resetea cuando vuelve a normal
+        self._update_consecutive_state(sensor_id, 'NORMAL', value)
 
         # Regla semántica: delta spike subordinado a rango WARNING.
         # Si el valor actual está dentro de [warningMin, warningMax], NO se marca delta spike.
@@ -230,23 +264,84 @@ class ReadingClassifier:
             )
 
         # 2. Verificar delta spike (cambios rápidos)
+        # FIX RAÍZ DEFINITIVO: Sin historial válido → NUNCA existe advertencia ni delta spike
+        # Una primera lectura NO tiene contexto histórico válido para evaluar delta spike
+        
+        # PASO 2.1: Obtener última lectura
         last_reading = self._get_last_reading(sensor_id)
-        if last_reading:
-            delta_info = self._check_delta_spike(
+        
+        # REGLA DE DOMINIO CRÍTICA: Sin historial → NO hay delta spike posible
+        if not last_reading:
+            return ClassifiedReading(
                 sensor_id=sensor_id,
-                current_value=value,
-                current_ts=ingest_timestamp,
-                last_reading=last_reading,
+                value=value,
+                device_timestamp=device_timestamp,
+                classification=ReadingClass.ML_PREDICTION,
+                reason="Primera lectura del sensor, sin historial para evaluar delta spike",
             )
-            if delta_info and delta_info.get("is_spike", False):
+        
+        # PASO 2.2: Validar que el historial sea RECIENTE (máximo 10 minutos)
+        # Si last_reading es viejo (ej: de hace días), NO es contexto válido
+        last_ts = last_reading.timestamp
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+        ingest_ts_utc = ingest_timestamp
+        if ingest_ts_utc.tzinfo is None:
+            ingest_ts_utc = ingest_ts_utc.replace(tzinfo=timezone.utc)
+        
+        last_reading_age_seconds = (ingest_ts_utc - last_ts).total_seconds()
+        max_valid_age_seconds = 600  # 10 minutos máximo para considerar historial válido
+        
+        if last_reading_age_seconds > max_valid_age_seconds:
+            # Historial demasiado viejo, NO es contexto válido para delta spike
+            return ClassifiedReading(
+                sensor_id=sensor_id,
+                value=value,
+                device_timestamp=device_timestamp,
+                classification=ReadingClass.ML_PREDICTION,
+                reason=f"Sin historial válido (última lectura hace {last_reading_age_seconds:.0f}s > {max_valid_age_seconds}s), delta spike no evaluado",
+            )
+        
+        # PASO 2.3: Verificar warm-up - mínimo de lecturas RECIENTES antes de evaluar delta spike
+        reading_count = self._get_sensor_reading_count(sensor_id)
+        min_readings_for_delta = self.DEFAULT_CONSECUTIVE_READINGS + 1  # Al menos 3 lecturas
+        
+        if reading_count < min_readings_for_delta:
+            # Sensor en warm-up, no evaluar delta spike
+            return ClassifiedReading(
+                sensor_id=sensor_id,
+                value=value,
+                device_timestamp=device_timestamp,
+                classification=ReadingClass.ML_PREDICTION,
+                reason=f"Sensor en warm-up ({reading_count}/{min_readings_for_delta} lecturas), delta spike no evaluado",
+            )
+        
+        # PASO 2.4: Ahora SÍ podemos evaluar delta spike (tenemos historial válido y reciente)
+        delta_info = self._check_delta_spike(
+            sensor_id=sensor_id,
+            current_value=value,
+            current_ts=ingest_timestamp,
+            last_reading=last_reading,
+        )
+        if delta_info and delta_info.get("is_spike", False):
+            # Verificar cooldown antes de generar advertencia
+            if self._is_in_cooldown(sensor_id, 'WARNING'):
                 return ClassifiedReading(
                     sensor_id=sensor_id,
                     value=value,
                     device_timestamp=device_timestamp,
-                    classification=ReadingClass.WARNING,
-                    delta_info=delta_info,
-                    reason=f"Delta spike detectado: {delta_info.get('reason', '')}",
+                    classification=ReadingClass.ML_PREDICTION,
+                    reason="Delta spike detectado pero en cooldown, ignorado",
                 )
+            
+            return ClassifiedReading(
+                sensor_id=sensor_id,
+                value=value,
+                device_timestamp=device_timestamp,
+                classification=ReadingClass.WARNING,
+                delta_info=delta_info,
+                reason=f"Delta spike detectado: {delta_info.get('reason', '')}",
+            )
 
         # 3. Dato limpio para ML (sin violación física ni delta spike fuerte)
         return ClassifiedReading(
@@ -429,6 +524,162 @@ class ReadingClassifier:
             return sensor_type
         except Exception:
             return 'default'
+
+    def _get_consecutive_readings_required(self, sensor_id: int) -> int:
+        """Obtiene el número de lecturas consecutivas requeridas para alertar.
+        
+        AGNÓSTICO AL TIPO DE SENSOR: El valor viene de la configuración del umbral
+        en la BD (alert_thresholds.consecutive_readings), no del tipo de sensor.
+        
+        Returns:
+            Número de lecturas consecutivas requeridas (default: 2)
+        """
+        # Intentar obtener de la BD (configurable por sensor)
+        try:
+            row = self._db.execute(
+                text(
+                    """
+                    SELECT TOP 1 consecutive_readings
+                    FROM dbo.alert_thresholds
+                    WHERE sensor_id = :sensor_id
+                      AND is_active = 1
+                      AND consecutive_readings IS NOT NULL
+                    ORDER BY id ASC
+                    """
+                ),
+                {"sensor_id": sensor_id},
+            ).fetchone()
+            
+            if row and row[0]:
+                return int(row[0])
+        except Exception:
+            pass
+        
+        return self.DEFAULT_CONSECUTIVE_READINGS
+
+    def _update_consecutive_state(self, sensor_id: int, new_state: str, value: float) -> int:
+        """Actualiza y retorna el conteo de lecturas consecutivas en el mismo estado.
+        
+        AGNÓSTICO AL TIPO DE SENSOR: Solo cuenta lecturas consecutivas en el mismo estado.
+        
+        Reglas:
+        - Si el estado cambia (ej: NORMAL → ALERT), resetea contador a 1
+        - Si el estado se mantiene (ej: ALERT → ALERT), incrementa contador
+        - Si vuelve a NORMAL, resetea contador a 0
+        
+        Args:
+            sensor_id: ID del sensor
+            new_state: Nuevo estado ('NORMAL', 'WARNING', 'ALERT')
+            value: Valor actual de la lectura
+            
+        Returns:
+            Número de lecturas consecutivas en el estado actual
+        """
+        current = self._consecutive_state_cache.get(sensor_id, {
+            'count': 0,
+            'last_state': 'NORMAL',
+            'last_value': None
+        })
+        
+        if new_state == 'NORMAL':
+            # Volver a normal resetea todo
+            self._consecutive_state_cache[sensor_id] = {
+                'count': 0,
+                'last_state': 'NORMAL',
+                'last_value': value
+            }
+            return 0
+        
+        if current['last_state'] == new_state:
+            # Mismo estado, incrementar contador
+            new_count = current['count'] + 1
+        else:
+            # Cambio de estado, empezar desde 1
+            new_count = 1
+        
+        self._consecutive_state_cache[sensor_id] = {
+            'count': new_count,
+            'last_state': new_state,
+            'last_value': value
+        }
+        
+        return new_count
+
+    # FIX PROBLEMA 1: Cache de conteo de lecturas por sensor
+    _reading_count_cache: dict = {}
+    
+    def _get_sensor_reading_count(self, sensor_id: int) -> int:
+        """Obtiene el número de lecturas del sensor en las últimas 2 horas.
+        
+        Usado para warm-up: no evaluar delta spikes hasta tener suficientes lecturas.
+        
+        Returns:
+            Número de lecturas recientes del sensor
+        """
+        if sensor_id in self._reading_count_cache:
+            return self._reading_count_cache[sensor_id]
+        
+        try:
+            row = self._db.execute(
+                text(
+                    """
+                    SELECT COUNT(*) as cnt
+                    FROM dbo.sensor_readings
+                    WHERE sensor_id = :sensor_id
+                      AND timestamp >= DATEADD(hour, -2, GETDATE())
+                    """
+                ),
+                {"sensor_id": sensor_id},
+            ).fetchone()
+            
+            count = int(row[0]) if row and row[0] else 0
+            self._reading_count_cache[sensor_id] = count
+            return count
+        except Exception:
+            return 0
+
+    # FIX PROBLEMA 2: Cache de cooldown por sensor y tipo de evento
+    # Estructura: {sensor_id: {'WARNING': datetime, 'ALERT': datetime}}
+    _cooldown_cache: dict = {}
+    COOLDOWN_SECONDS = 300  # 5 minutos de cooldown entre eventos del mismo tipo
+    
+    def _is_in_cooldown(self, sensor_id: int, event_type: str) -> bool:
+        """Verifica si el sensor está en período de cooldown para el tipo de evento.
+        
+        Evita generar múltiples advertencias/alertas en corto tiempo.
+        
+        Args:
+            sensor_id: ID del sensor
+            event_type: Tipo de evento ('WARNING', 'ALERT')
+            
+        Returns:
+            True si está en cooldown, False si puede generar evento
+        """
+        now = datetime.now(timezone.utc)
+        
+        if sensor_id not in self._cooldown_cache:
+            self._cooldown_cache[sensor_id] = {}
+        
+        last_event = self._cooldown_cache[sensor_id].get(event_type)
+        if last_event:
+            elapsed = (now - last_event).total_seconds()
+            if elapsed < self.COOLDOWN_SECONDS:
+                return True
+        
+        # No está en cooldown, registrar este evento
+        self._cooldown_cache[sensor_id][event_type] = now
+        return False
+    
+    def _clear_cooldown(self, sensor_id: int, event_type: str = None) -> None:
+        """Limpia el cooldown de un sensor.
+        
+        Llamar cuando se atiende/resuelve una alerta para permitir nuevos eventos.
+        """
+        if sensor_id in self._cooldown_cache:
+            if event_type:
+                self._cooldown_cache[sensor_id].pop(event_type, None)
+            else:
+                self._cooldown_cache[sensor_id] = {}
 
     def _check_delta_spike(
         self,
