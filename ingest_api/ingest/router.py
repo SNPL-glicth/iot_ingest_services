@@ -44,6 +44,23 @@ class ReadingRouter:
         self._db = db
         self._broker = broker
         self._logger = logging.getLogger(__name__)
+        self._sensor_type_cache: dict[int, str] = {}
+
+    def _get_sensor_type(self, sensor_id: int) -> str:
+        """Obtiene el tipo de sensor desde cache o BD."""
+        if sensor_id in self._sensor_type_cache:
+            return self._sensor_type_cache[sensor_id]
+        
+        try:
+            result = self._db.execute(
+                text("SELECT sensor_type FROM dbo.sensors WHERE id = :id"),
+                {"id": sensor_id}
+            ).fetchone()
+            sensor_type = result[0] if result and result[0] else "unknown"
+            self._sensor_type_cache[sensor_id] = sensor_type
+            return sensor_type
+        except Exception:
+            return "unknown"
 
     def classify_and_route(
         self,
@@ -131,18 +148,27 @@ class ReadingRouter:
         try:
             if self._broker:
                 from iot_ingest_services.ml_service.reading_broker import Reading
+                # FIX: Reading requires sensor_type (str) and timestamp (float, not datetime)
+                # Obtener sensor_type de la BD si es necesario
+                sensor_type = self._get_sensor_type(sensor_id)
                 reading = Reading(
                     sensor_id=sensor_id,
-                    value=value,
-                    timestamp=ingest_timestamp,
+                    sensor_type=sensor_type,
+                    value=float(value),
+                    timestamp=ingest_timestamp.timestamp(),  # Convert datetime to float
                 )
                 self._broker.publish(reading)
+                self._logger.debug(
+                    "BROKER PUBLISHED sensor_id=%s value=%s",
+                    sensor_id, value
+                )
         except Exception as e:
             # No fallar si el broker falla - la lectura ya está persistida
             self._logger.warning(
-                "BROKER PUBLISH FAILED sensor_id=%s err=%s",
+                "BROKER PUBLISH FAILED sensor_id=%s err=%s: %s",
                 sensor_id,
                 type(e).__name__,
+                str(e),
             )
 
         return PipelineType.SP_HANDLED

@@ -90,12 +90,24 @@ class SimpleMlOnlineProcessor:
         El procesamiento es puramente online: ventanas deslizantes en memoria y
         escritura de eventos en `ml_events` + `alert_notifications`.
         """
+        import time
+        start_time = time.time()
 
         sensor_id = reading.sensor_id
+        reading_ts = float(reading.timestamp)
+        ingest_latency_ms = (start_time - reading_ts) * 1000 if reading_ts > 0 else 0
+        
+        # FIX Issue 3: Log latency for debugging ML warning delays
+        if ingest_latency_ms > 1000:  # Log if latency > 1 second
+            logger.warning(
+                "[ML_LATENCY] High ingest latency sensor_id=%s latency_ms=%.1f",
+                sensor_id, ingest_latency_ms
+            )
+        
         stats_by_window = self._buffer.add_reading(
             sensor_id=sensor_id,
             value=float(reading.value),
-            timestamp=float(reading.timestamp),
+            timestamp=reading_ts,
             windows=(1.0, 5.0, 10.0),
         )
 
@@ -135,6 +147,13 @@ class SimpleMlOnlineProcessor:
         if should_emit:
             event_type = self._map_severity_to_event_type(severity)
             title = self._build_title(event_code, severity, analysis.behavior_pattern)
+
+            # FIX Issue 3: Log event emission with timing
+            processing_time_ms = (time.time() - start_time) * 1000
+            logger.info(
+                "[ML_EVENT] Emitting event sensor_id=%s code=%s severity=%s processing_ms=%.1f",
+                sensor_id, event_code, severity, processing_time_ms
+            )
 
             self._insert_ml_event(
                 sensor_id=sensor_id,
