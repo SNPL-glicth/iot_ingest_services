@@ -9,7 +9,7 @@ from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
+from iot_machine_learning.ml_service.reading_broker import Reading, ReadingBroker
 
 # FIX AUDITORIA: Logger para diagnóstico de dedupe
 _logger = logging.getLogger(__name__)

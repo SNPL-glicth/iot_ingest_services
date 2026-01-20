@@ -18,7 +18,7 @@ from enum import Enum
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
-from iot_ingest_services.ml_service.reading_broker import ReadingBroker
+from iot_machine_learning.ml_service.reading_broker import ReadingBroker
 
 from .common.validation import is_suspicious_zero_reading, log_suspicious_reading
 from .common.guards import guard_reading, ValidationResult
@@ -147,7 +147,7 @@ class ReadingRouter:
         # El SP ya insertó la lectura, solo notificamos al broker
         try:
             if self._broker:
-                from iot_ingest_services.ml_service.reading_broker import Reading
+                from iot_machine_learning.ml_service.reading_broker import Reading
                 # FIX: Reading requires sensor_type (str) and timestamp (float, not datetime)
                 # Obtener sensor_type de la BD si es necesario
                 sensor_type = self._get_sensor_type(sensor_id)

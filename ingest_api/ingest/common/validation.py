@@ -126,6 +126,50 @@ def _get_recent_reading_count(db: Session, sensor_id: int, hours: int = WARMUP_W
         return 0
 
 
+def _get_warning_thresholds(db: Session, sensor_id: int) -> tuple[Optional[float], Optional[float]]:
+    """Obtiene los umbrales WARNING del usuario para el sensor.
+    
+    Returns:
+        (warning_min, warning_max) o (None, None) si no hay umbrales configurados
+    """
+    from sqlalchemy import text
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT threshold_value_min, threshold_value_max
+                FROM dbo.alert_thresholds
+                WHERE sensor_id = :sensor_id
+                  AND is_active = 1
+                  AND severity = 'warning'
+                  AND condition_type = 'out_of_range'
+                ORDER BY id ASC
+                """
+            ),
+            {"sensor_id": sensor_id},
+        ).fetchone()
+        
+        if not row:
+            return None, None
+        
+        warning_min = float(row[0]) if row[0] is not None else None
+        warning_max = float(row[1]) if row[1] is not None else None
+        return warning_min, warning_max
+    except Exception:
+        return None, None
+
+
+def _is_value_within_warning_range(value: float, warning_min: Optional[float], warning_max: Optional[float]) -> bool:
+    """Verifica si el valor está dentro del rango WARNING del usuario."""
+    if warning_min is None and warning_max is None:
+        return False
+    if warning_min is not None and value < warning_min:
+        return False
+    if warning_max is not None and value > warning_max:
+        return False
+    return True
+
+
 def validate_warning_data(
     db: Session,
     sensor_id: int,
@@ -137,11 +181,16 @@ def validate_warning_data(
     MODELO DE ESTADOS:
     Usa SensorStateManager como único punto de decisión.
     
+    REGLA DE DOMINIO CRÍTICA:
+    Si el valor está dentro del rango WARNING del usuario, NO puede haber
+    delta spike. El usuario definió ese rango como "normal".
+    
     Requiere:
     0. Sensor en estado que permite eventos (NORMAL, WARNING, ALERT)
-    1. Lectura previa reciente (máx 10 minutos)
-    2. Umbrales de delta configurados
-    3. Delta spike detectado
+    1. Valor FUERA del rango WARNING del usuario
+    2. Lectura previa reciente (máx 10 minutos)
+    3. Umbrales de delta configurados
+    4. Delta spike detectado
 
     Returns:
         (is_valid, delta_info, reason)
@@ -160,17 +209,25 @@ def validate_warning_data(
     if not can_generate:
         return False, None, f"Sensor bloqueado para eventos: {state_reason}"
 
-    # PASO 1: Verificar que existe lectura previa RECIENTE
+    # =========================================================================
+    # PASO 1: REGLA DE DOMINIO - Verificar umbrales del usuario
+    # Si el valor está dentro del rango WARNING, NO puede haber delta spike.
+    # =========================================================================
+    warning_min, warning_max = _get_warning_thresholds(db, sensor_id)
+    if _is_value_within_warning_range(value, warning_min, warning_max):
+        return False, None, "Valor dentro del rango WARNING del usuario; delta spike no aplica"
+
+    # PASO 2: Verificar que existe lectura previa RECIENTE
     last_reading = get_last_reading(db, sensor_id)
     if not last_reading:
         return False, None, "Sin historial reciente para evaluar delta spike"
 
-    # PASO 2: Verificar umbrales de delta configurados
+    # PASO 3: Verificar umbrales de delta configurados
     delta_threshold = get_delta_threshold(db, sensor_id)
     if not delta_threshold:
         return False, None, "No hay umbrales de delta configurados para este sensor"
 
-    # PASO 3: Evaluar delta spike
+    # PASO 4: Evaluar delta spike
     delta_info = check_delta_spike(
         current_value=value,
         current_ts=current_ts,

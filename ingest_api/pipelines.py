@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from sqlalchemy import text
 
-from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
+from iot_machine_learning.ml_service.reading_broker import Reading, ReadingBroker
 from .classification import ReadingClassifier, ReadingClass, ClassifiedReading
 from .ingest_flows import ingest_alert, ingest_warning, ingest_prediction
 from .ingest.predictions.prediction_dispatch import should_skip_prediction

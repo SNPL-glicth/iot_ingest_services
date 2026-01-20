@@ -171,12 +171,20 @@ def get_last_clean_reading(db: Session, sensor_id: int, max_age_seconds: int = 6
 # Bug 3.5: Umbral mínimo de dt para evaluar slope (evita falsos positivos en batch)
 MIN_DT_FOR_SLOPE_SECONDS = 1.0
 
+# FIX CRÍTICO: Umbrales mínimos de ruido para evitar falsos positivos
+# Un delta spike REAL requiere un cambio significativo, no variaciones mínimas
+# Estos son umbrales conservadores que filtran ruido de sensor
+NOISE_FLOOR_ABS = 0.1  # Delta absoluto mínimo para considerar spike
+NOISE_FLOOR_REL = 0.01  # Delta relativo mínimo (1%) para considerar spike
+
 
 def check_delta_spike(
     current_value: float,
     current_ts: datetime,
     last_reading: LastReading,
     delta_threshold: DeltaThreshold,
+    noise_floor_abs: float = NOISE_FLOOR_ABS,
+    noise_floor_rel: float = NOISE_FLOOR_REL,
 ) -> Optional[dict]:
     """Verifica si hay un delta spike usando umbrales de delta/slope.
 
@@ -188,6 +196,10 @@ def check_delta_spike(
 
     Bug 3.5: Si dt < 1s, NO se evalúan thresholds de slope para evitar
     falsos positivos en lecturas batch o muy cercanas.
+    
+    FIX CRÍTICO: Aplica filtro de ruido ANTES de evaluar umbrales.
+    Si el delta está por debajo del umbral de ruido, NO es spike.
+    Esto evita falsos positivos en lecturas estables dentro del rango.
 
     Returns:
         dict con is_spike=True si se detecta spike, None en caso contrario
@@ -205,6 +217,19 @@ def check_delta_spike(
     delta_rel = 0.0
     if abs(last_reading.value) > 1e-6:
         delta_rel = abs(delta_abs / last_reading.value)
+
+    # =========================================================================
+    # FIX CRÍTICO: Filtrar ruido ANTES de evaluar umbrales
+    # REGLA CORRECTA: Solo es ruido si AMBOS deltas están por debajo del umbral.
+    # Si al menos uno supera el umbral de ruido, puede ser un spike válido.
+    # 
+    # Lógica anterior (incorrecta): OR causaba falsos negativos
+    # Lógica correcta: AND - solo filtrar si AMBOS son insignificantes
+    # =========================================================================
+    is_below_noise_floor = delta_abs < noise_floor_abs and delta_rel < noise_floor_rel
+    if is_below_noise_floor:
+        # Variación dentro del ruido normal del sensor, NO es spike
+        return None
 
     # Bug 3.5: Solo calcular slope si dt >= umbral mínimo
     can_evaluate_slope = dt_seconds >= MIN_DT_FOR_SLOPE_SECONDS

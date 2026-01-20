@@ -13,8 +13,8 @@ from sqlalchemy.orm import Session
 
 from iot_ingest_services.common.db import get_db
 from .rate_limiter import get_rate_limiter, get_client_ip
-from iot_ingest_services.ml_service.reading_broker import Reading, ReadingBroker
-from iot_ingest_services.ml_service.in_memory_broker import InMemoryReadingBroker
+from iot_machine_learning.ml_service.reading_broker import Reading, ReadingBroker
+from iot_machine_learning.ml_service.in_memory_broker import InMemoryReadingBroker
 from .ingest.router import ReadingRouter
 from .batch_inserter import BatchInserter, get_batch_inserter, init_batch_inserter, shutdown_batch_inserter
 from iot_ingest_services.common.db import get_engine

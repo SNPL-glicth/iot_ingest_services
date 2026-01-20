@@ -10,7 +10,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from iot_ingest_services.ml_service.reading_broker import ReadingBroker
+from iot_machine_learning.ml_service.reading_broker import ReadingBroker
 
 from .prediction_rules import PredictionRules
 from .prediction_dispatch import (

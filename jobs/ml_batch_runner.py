@@ -9,8 +9,8 @@ from typing import Iterable
 from sqlalchemy import text
 
 from iot_ingest_services.common.db import get_engine
-from iot_ingest_services.ml.baseline import BaselineConfig, predict_moving_average
-from iot_ingest_services.ml.metadata import BASELINE_MOVING_AVERAGE
+from iot_machine_learning.ml.baseline import BaselineConfig, predict_moving_average
+from iot_machine_learning.ml.metadata import BASELINE_MOVING_AVERAGE
 
 
 @dataclass(frozen=True)

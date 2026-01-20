@@ -27,7 +27,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
 # FIX FASE2: Importar funciones canónicas de precisión
-from iot_ingest_services.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
+from iot_machine_learning.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
 
 # FIX MODELO DE ESTADOS: Importar gestor de estado operacional
 from .sensor_state import SensorStateManager, SensorOperationalState
@@ -299,8 +299,15 @@ class ReadingClassifier:
         # Esto es crítico para el enfoque agnóstico: el estado se resetea cuando vuelve a normal
         self._update_consecutive_state(sensor_id, 'NORMAL', value)
 
-        # Regla semántica: delta spike subordinado a rango WARNING.
-        # Si el valor actual está dentro de [warningMin, warningMax], NO se marca delta spike.
+        # =====================================================================
+        # REGLA DE DOMINIO CRÍTICA: Delta spike subordinado a umbrales del usuario
+        # =====================================================================
+        # Si el valor actual está dentro de [warningMin, warningMax], NO se marca
+        # delta spike. El usuario definió ese rango como "normal".
+        # 
+        # CASO ESPECIAL: Si el sensor empieza a reportar desde un valor estable
+        # dentro del rango (ej: 10 dentro de 6-13), NO es un spike aunque la
+        # última lectura guardada fuera diferente.
         thresholds = self._get_canonical_thresholds(sensor_id)
         if self._is_within_warning_band(value, thresholds):
             return ClassifiedReading(
@@ -308,7 +315,7 @@ class ReadingClassifier:
                 value=value,
                 device_timestamp=device_timestamp,
                 classification=ReadingClass.ML_PREDICTION,
-                reason="Dato dentro de rango WARNING; delta spike no aplica",
+                reason="Dato dentro de rango WARNING del usuario; delta spike no aplica",
             )
 
         # =====================================================================
@@ -351,6 +358,8 @@ class ReadingClassifier:
             )
         
         # Evaluar delta spike
+        # NOTA: Si llegamos aquí, el valor actual está FUERA del rango WARNING.
+        # Un delta spike es válido si hay un cambio abrupto significativo.
         delta_info = self._check_delta_spike(
             sensor_id=sensor_id,
             current_value=value,
@@ -761,10 +770,14 @@ class ReadingClassifier:
             delta_rel = abs(delta_abs / last_reading.value)
 
         # FIX CRÍTICO: Filtrar ruido usando umbrales específicos del tipo de sensor.
-        # Si el delta está por debajo del umbral de ruido del tipo, no es spike.
+        # REGLA CORRECTA: Solo es ruido si AMBOS deltas están por debajo del umbral.
+        # Si al menos uno supera el umbral de ruido, puede ser un spike válido.
+        # 
+        # Lógica anterior (incorrecta): OR causaba falsos negativos
+        # Lógica correcta: AND - solo filtrar si AMBOS son insignificantes
         is_noise = delta_abs < noise_abs and delta_rel < noise_rel
         if is_noise:
-            return None  # Variación normal del sensor, no es spike
+            return None  # Variación dentro del ruido normal del sensor
 
         # Evitar división por cero o dt negativo
         if dt_seconds <= 0:

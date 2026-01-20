@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple, Dict
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from iot_ingest_services.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
+from iot_machine_learning.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
 
 
 @dataclass
