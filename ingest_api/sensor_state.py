@@ -71,7 +71,8 @@ class SensorStateManager:
     """
     
     # Fallback si la columna no existe en BD (migración pendiente)
-    DEFAULT_MIN_READINGS = 3
+    # FIX: Aumentado a 10 para warm-up adecuado (alineado con SP)
+    DEFAULT_MIN_READINGS = 10
     
     def __init__(self, db: Session | Connection) -> None:
         self._db = db

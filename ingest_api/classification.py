@@ -193,7 +193,7 @@ class ReadingClassifier:
     # Regla: Se requieren N lecturas CONSECUTIVAS fuera del umbral para cambiar de estado
     # Esto es configurable por sensor en la BD (tabla alert_thresholds.consecutive_readings)
     # Si no está configurado, se usa el default.
-    DEFAULT_CONSECUTIVE_READINGS = 2  # Lecturas consecutivas fuera de umbral para alertar
+    DEFAULT_CONSECUTIVE_READINGS = 3  # Lecturas consecutivas fuera de umbral para alertar
     
     # Cache de estado de lecturas consecutivas por sensor
     # Estructura: {sensor_id: {'count': int, 'last_state': str, 'last_value': float}}
