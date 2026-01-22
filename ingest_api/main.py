@@ -208,12 +208,31 @@ _SENSOR_MAP_CACHE: Dict[Tuple[str, str], Tuple[int, datetime]] = {}
 
 
 def _require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
-    # If INGEST_API_KEY is not set, we allow requests (dev mode).
+    """Validate API key for legacy endpoints.
+    
+    SECURITY FIX: In production, INGEST_API_KEY must be configured.
+    In dev mode, allows unauthenticated access with warning.
+    """
     expected = os.getenv("INGEST_API_KEY")
+    is_production = os.getenv("NODE_ENV") == "production" or os.getenv("ENVIRONMENT") == "production"
+    
     if not expected:
+        if is_production:
+            # SECURITY FIX: Fail-fast in production if not configured
+            logging.error("CRITICAL: INGEST_API_KEY not configured in production!")
+            raise HTTPException(
+                status_code=500, 
+                detail="Server misconfiguration: API key not set"
+            )
+        # Dev mode: warn but allow
+        logging.warning("[SECURITY WARNING] INGEST_API_KEY not set - allowing unauthenticated access (DEV ONLY)")
         return
 
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="API key required")
+    
     if x_api_key != expected:
+        logging.warning(f"Invalid API key attempt from request")
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 

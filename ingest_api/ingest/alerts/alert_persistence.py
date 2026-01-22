@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import os
+import logging
 from datetime import datetime
 
+import requests
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..common.physical_ranges import PhysicalRange
+from ...sensor_state import SensorStateManager, SensorOperationalState
+
+logger = logging.getLogger(__name__)
 
 
 def persist_alert(
@@ -107,10 +113,26 @@ def persist_alert(
         },
     )
 
-    # 4. CRÍTICO: Crear notificación en alert_notifications
+    # 4. SSOT: Actualizar estado operacional del sensor a ALERT
+    #    Esto garantiza consistencia entre alerts table y sensors.operational_state
+    try:
+        state_manager = SensorStateManager(db)
+        success, msg, is_new = state_manager.on_threshold_violated(
+            sensor_id=sensor_id,
+            severity="critical",  # Alertas físicas siempre son críticas
+            reason=f"Physical threshold violation: {value}",
+        )
+        if success:
+            logger.debug(f"[SSOT] Sensor {sensor_id} state updated: {msg}")
+        else:
+            logger.warning(f"[SSOT] Failed to update sensor {sensor_id} state: {msg}")
+    except Exception as e:
+        logger.error(f"[SSOT] Error updating sensor state: {e}")
+
+    # 5. CRÍTICO: Crear notificación en alert_notifications
     #    Esto es lo que faltaba - las alertas físicas NO estaban creando notificaciones
     #    Solo se crea si es una alerta NUEVA (no update de existente)
-    _create_alert_notification(
+    alert_id = _create_alert_notification(
         db=db,
         sensor_id=sensor_id,
         device_id=device_id,
@@ -118,6 +140,10 @@ def persist_alert(
         physical_range=physical_range,
         ingest_timestamp=ingest_timestamp,
     )
+    
+    # 6. PUSH NOTIFICATION: Disparar push via backend NestJS
+    if alert_id:
+        _trigger_push_notification(alert_id)
 
 
 def _create_alert_notification(
@@ -127,7 +153,7 @@ def _create_alert_notification(
     value: float,
     physical_range: PhysicalRange,
     ingest_timestamp: datetime,
-) -> None:
+) -> int | None:
     """Crea una notificación para una alerta física.
     
     SSOT: La tabla alert_notifications es la fuente de verdad para READ/UNREAD.
@@ -136,6 +162,9 @@ def _create_alert_notification(
     - source = 'alert' (NO 'ml_event')
     - severity = 'critical' (alertas físicas siempre son críticas)
     - Deduplicación: no crear si ya existe una notificación no leída para este sensor
+    
+    Returns:
+        alert_id if notification was created, None otherwise
     """
     # Obtener nombre del sensor para el título
     sensor_row = db.execute(
@@ -171,7 +200,7 @@ def _create_alert_notification(
 
     if existing:
         # Ya existe una notificación reciente no leída, no crear duplicado
-        return
+        return None
 
     # Obtener el ID de la alerta recién creada/actualizada
     alert_row = db.execute(
@@ -186,7 +215,7 @@ def _create_alert_notification(
     ).fetchone()
 
     if not alert_row:
-        return
+        return None
 
     alert_id = int(alert_row[0])
 
@@ -228,4 +257,41 @@ def _create_alert_notification(
             "created_at": ingest_timestamp,
         },
     )
+    
+    return alert_id
+
+
+def _trigger_push_notification(alert_id: int) -> None:
+    """Dispara push notification via backend NestJS.
+    
+    Llama al endpoint interno del backend para enviar FCM push.
+    No bloquea si falla - solo loguea el error.
+    """
+    backend_url = os.getenv("BACKEND_URL", "http://localhost:3000")
+    internal_key = os.getenv("INTERNAL_API_KEY")
+    
+    if not internal_key:
+        logger.warning("[PUSH] INTERNAL_API_KEY not configured - skipping push trigger")
+        return
+    
+    try:
+        response = requests.post(
+            f"{backend_url}/notifications/internal/trigger-push",
+            json={
+                "type": "alert",
+                "alertId": str(alert_id),
+            },
+            headers={
+                "X-Internal-Key": internal_key,
+                "Content-Type": "application/json",
+            },
+            timeout=5,
+        )
+        
+        if response.ok:
+            logger.info(f"[PUSH] Alert push triggered for alertId={alert_id}")
+        else:
+            logger.warning(f"[PUSH] Failed to trigger push: {response.status_code} {response.text}")
+    except Exception as e:
+        logger.error(f"[PUSH] Error triggering push notification: {e}")
 

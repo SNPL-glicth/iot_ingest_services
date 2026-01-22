@@ -301,11 +301,19 @@ class SensorStateManager:
         
         Valida que la transición sea válida según la máquina de estados.
         
+        SECURITY FIX: Atomic transition with optimistic locking to prevent race conditions.
+        - Invalidate cache BEFORE operation
+        - Use conditional UPDATE with current state check
+        - Re-read from DB after update to confirm
+        
         Returns:
             (success, message)
         """
         if not self._check_columns_exist():
             return False, "Columnas de estado no existen en BD"
+        
+        # SECURITY FIX: Invalidate cache BEFORE reading to ensure fresh read
+        self._cache.pop(sensor_id, None)
         
         current = self.get_state(sensor_id)
         
@@ -338,10 +346,11 @@ class SensorStateManager:
         if new_state not in allowed and new_state != current.state:
             return False, f"Transición inválida: {current.state.value} → {new_state.value}"
         
-        # Ejecutar transición
+        # Ejecutar transición con OPTIMISTIC LOCKING
+        # SECURITY FIX: Only update if current state matches expected (prevents race condition)
         reset_count = 1 if new_state == SensorOperationalState.INITIALIZING else 0
         
-        self._db.execute(
+        result = self._db.execute(
             text("""
                 UPDATE dbo.sensors
                 SET 
@@ -352,16 +361,24 @@ class SensorStateManager:
                         ELSE valid_readings_count 
                     END
                 WHERE id = :sensor_id
+                  AND operational_state = :expected_state
             """),
             {
                 "sensor_id": sensor_id,
                 "new_state": new_state.value,
                 "reset": reset_count,
+                "expected_state": current.state.value,
             },
         )
         
-        # Invalidar cache
-        self._cache.pop(sensor_id, None)
+        # SECURITY FIX: Check if update actually happened (rowcount > 0)
+        rows_affected = result.rowcount if hasattr(result, 'rowcount') else 1
+        
+        if rows_affected == 0:
+            # Race condition detected: state changed between read and write
+            self._cache.pop(sensor_id, None)  # Ensure cache is cleared
+            actual = self.get_state(sensor_id)
+            return False, f"Race condition: estado cambió de {current.state.value} a {actual.state.value} durante transición"
         
         return True, f"Transición exitosa: {current.state.value} → {new_state.value}"
     
@@ -371,3 +388,152 @@ class SensorStateManager:
             self._cache.pop(sensor_id, None)
         else:
             self._cache.clear()
+    
+    # =========================================================================
+    # MÉTODOS DE TRANSICIÓN BASADOS EN EVENTOS ML
+    # Estos métodos implementan la máquina de estados REAL para alertas
+    # =========================================================================
+    
+    def on_threshold_violated(
+        self, 
+        sensor_id: int, 
+        severity: str,
+        reason: Optional[str] = None,
+    ) -> Tuple[bool, str, bool]:
+        """Maneja transición cuando se viola un umbral.
+        
+        REGLA DE DOMINIO:
+        - NORMAL -> WARNING (si severity=warning)
+        - NORMAL -> ALERT (si severity=critical)
+        - WARNING -> ALERT (si severity=critical)
+        - WARNING -> WARNING (solo update, NO crear nuevo evento)
+        - ALERT -> ALERT (solo update, NO crear nuevo evento)
+        
+        Returns:
+            (success, message, is_new_transition)
+            is_new_transition=True significa que debe crearse evento
+            is_new_transition=False significa que solo debe actualizarse
+        """
+        current = self.get_state(sensor_id)
+        sev_lower = severity.lower() if severity else "warning"
+        
+        # Determinar estado destino
+        if sev_lower == "critical":
+            target_state = SensorOperationalState.ALERT
+        else:
+            target_state = SensorOperationalState.WARNING
+        
+        # Si ya está en el estado destino o superior, NO es nueva transición
+        if current.state == target_state:
+            return True, f"Sensor ya en {target_state.value}, solo update", False
+        
+        if current.state == SensorOperationalState.ALERT and target_state == SensorOperationalState.WARNING:
+            # ALERT es más severo que WARNING, mantener ALERT
+            return True, "Sensor en ALERT, mantener estado", False
+        
+        # Verificar si puede transicionar
+        if current.state not in (
+            SensorOperationalState.NORMAL,
+            SensorOperationalState.WARNING,
+            SensorOperationalState.ALERT,
+        ):
+            return False, f"Sensor en {current.state.value}, no puede generar eventos", False
+        
+        # Ejecutar transición
+        success, msg = self.transition_to(sensor_id, target_state, reason)
+        return success, msg, success  # is_new_transition = success
+    
+    def on_value_back_to_normal(
+        self, 
+        sensor_id: int,
+        reason: Optional[str] = None,
+    ) -> Tuple[bool, str, bool]:
+        """Maneja transición cuando el valor vuelve a rango normal.
+        
+        REGLA DE DOMINIO:
+        - WARNING -> NORMAL (resolver evento)
+        - ALERT -> NORMAL (resolver evento)
+        - NORMAL -> NORMAL (no-op)
+        
+        Returns:
+            (success, message, was_in_alert_state)
+            was_in_alert_state=True significa que había evento activo que resolver
+        """
+        current = self.get_state(sensor_id)
+        
+        # Si ya está en NORMAL, no hay nada que hacer
+        if current.state == SensorOperationalState.NORMAL:
+            return True, "Sensor ya en NORMAL", False
+        
+        # Si está en WARNING o ALERT, transicionar a NORMAL
+        if current.state in (SensorOperationalState.WARNING, SensorOperationalState.ALERT):
+            was_in_alert = current.state in (SensorOperationalState.WARNING, SensorOperationalState.ALERT)
+            success, msg = self.transition_to(sensor_id, SensorOperationalState.NORMAL, reason)
+            return success, msg, was_in_alert
+        
+        # Otros estados (INITIALIZING, STALE) no aplican
+        return False, f"Sensor en {current.state.value}, transición a NORMAL no aplica", False
+    
+    def get_active_event_count(self, sensor_id: int) -> int:
+        """Cuenta eventos activos para un sensor.
+        
+        Útil para verificar consistencia entre estado del sensor y eventos ML.
+        """
+        try:
+            row = self._db.execute(
+                text("""
+                    SELECT COUNT(*) as cnt
+                    FROM dbo.ml_events
+                    WHERE sensor_id = :sensor_id
+                    AND status = 'active'
+                """),
+                {"sensor_id": sensor_id},
+            ).fetchone()
+            return int(row.cnt) if row and row.cnt else 0
+        except Exception:
+            return 0
+    
+    def sync_state_with_events(self, sensor_id: int) -> Tuple[bool, str]:
+        """Sincroniza el estado del sensor con los eventos ML activos.
+        
+        REGLA DE DOMINIO:
+        - Si hay eventos activos pero sensor en NORMAL -> transicionar a WARNING/ALERT
+        - Si no hay eventos activos pero sensor en WARNING/ALERT -> transicionar a NORMAL
+        
+        Esto garantiza consistencia entre la tabla sensors y ml_events.
+        """
+        current = self.get_state(sensor_id)
+        active_count = self.get_active_event_count(sensor_id)
+        
+        if active_count > 0 and current.state == SensorOperationalState.NORMAL:
+            # Hay eventos activos pero sensor en NORMAL -> inconsistencia
+            # Verificar severidad del evento más severo
+            row = self._db.execute(
+                text("""
+                    SELECT TOP 1 event_type
+                    FROM dbo.ml_events
+                    WHERE sensor_id = :sensor_id AND status = 'active'
+                    ORDER BY 
+                        CASE event_type 
+                            WHEN 'critical' THEN 1 
+                            WHEN 'warning' THEN 2 
+                            ELSE 3 
+                        END
+                """),
+                {"sensor_id": sensor_id},
+            ).fetchone()
+            
+            if row:
+                event_type = str(row[0]).lower()
+                if event_type == "critical":
+                    self.transition_to(sensor_id, SensorOperationalState.ALERT, "sync_with_events")
+                else:
+                    self.transition_to(sensor_id, SensorOperationalState.WARNING, "sync_with_events")
+                return True, f"Sensor sincronizado: NORMAL -> {event_type.upper()}"
+        
+        elif active_count == 0 and current.state in (SensorOperationalState.WARNING, SensorOperationalState.ALERT):
+            # No hay eventos activos pero sensor en WARNING/ALERT -> inconsistencia
+            self.transition_to(sensor_id, SensorOperationalState.NORMAL, "sync_with_events")
+            return True, f"Sensor sincronizado: {current.state.value} -> NORMAL"
+        
+        return True, "Estado consistente"
