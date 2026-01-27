@@ -134,6 +134,7 @@ def _insert_prediction(
     *,
     model_id: int,
     sensor_id: int,
+    device_id: int,
     predicted_value: float,
     confidence: float,
     target_ts_utc: datetime,
@@ -142,17 +143,18 @@ def _insert_prediction(
         text(
             """
             INSERT INTO dbo.predictions (
-              model_id, sensor_id, predicted_value, confidence, predicted_at, target_timestamp
+              model_id, sensor_id, device_id, predicted_value, confidence, predicted_at, target_timestamp
             )
             OUTPUT INSERTED.id
             VALUES (
-              :model_id, :sensor_id, :predicted_value, :confidence, GETDATE(), :target_timestamp
+              :model_id, :sensor_id, :device_id, :predicted_value, :confidence, GETDATE(), :target_timestamp
             )
             """
         ),
         {
             "model_id": model_id,
             "sensor_id": sensor_id,
+            "device_id": device_id,
             "predicted_value": predicted_value,
             "confidence": confidence,
             # SQL Server datetime2 expects tz-naive
@@ -377,18 +379,18 @@ def run_once(cfg: RunnerConfig) -> None:
             predicted_value, confidence = predict_moving_average(values, baseline_cfg)
 
             model_id = _get_or_create_active_model_id(conn, sensor_id)
+            device_id = _get_device_id_for_sensor(conn, sensor_id)
             target_ts = _utc_now() + timedelta(minutes=cfg.horizon_minutes)
 
             prediction_id = _insert_prediction(
                 conn,
                 model_id=model_id,
                 sensor_id=sensor_id,
+                device_id=device_id,
                 predicted_value=predicted_value,
                 confidence=confidence,
                 target_ts_utc=target_ts,
             )
-
-            device_id = _get_device_id_for_sensor(conn, sensor_id)
             _eval_pred_threshold_and_create_event(
                 conn,
                 sensor_id=sensor_id,
