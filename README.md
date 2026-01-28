@@ -102,3 +102,48 @@
  ### ¿Qué pasa si `ai-explainer` está caído?
  
  No bloquea la ingesta: `ai_explainer_runner.py` es un job separado y maneja errores por predicción, simplemente omite y continúa.
+
+
+
+ingest_api/
+├── main.py                 # 65 líneas (solo wiring)
+│
+├── endpoints/              # Capa HTTP
+│   ├── health.py
+│   ├── sensor_status.py
+│   ├── single_ingest.py
+│   ├── batch_ingest.py
+│   └── packet_ingest.py
+│
+├── auth/                   # Autenticación
+│   ├── api_key.py
+│   └── device_key.py
+│
+├── broker/                 # Publicación a ML
+│   ├── throttled.py
+│   └── factory.py
+│
+├── queries/                # Consultas BD
+│   └── sensor_status.py
+│
+├── classification/         # ← NUEVO (Fase 4)
+│   ├── classifier.py       # ReadingClassifier
+│   └── sensor_state.py     # SensorStateManager
+│
+├── ingest/                 # Core de ingesta
+│   ├── router.py
+│   ├── sensor_resolver.py
+│   ├── handlers/
+│   │   ├── single.py
+│   │   └── batch.py
+│   ├── alerts/
+│   ├── warnings/
+│   ├── predictions/
+│   └── common/
+│       └── delta_utils.py  # Lógica de delta spike
+│
+├── debug.py
+├── batch_inserter.py
+├── rate_limiter.py
+├── device_auth.py
+└── schemas.py
