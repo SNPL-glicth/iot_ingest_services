@@ -22,7 +22,7 @@ from .physical_ranges import PhysicalRange, get_physical_range
 from .delta_utils import DeltaThreshold, LastReading, get_delta_threshold, get_last_reading, check_delta_spike
 
 # FIX MODELO DE ESTADOS: Importar gestor de estado operacional
-from iot_ingest_services.ingest_api.sensor_state import SensorStateManager
+from iot_ingest_services.ingest_api.classification.sensor_state import SensorStateManager
 
 logger = logging.getLogger(__name__)
 
