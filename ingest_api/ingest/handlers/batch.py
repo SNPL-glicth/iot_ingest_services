@@ -66,6 +66,7 @@ class BatchReadingHandler:
         """Ingesta usando el router (SP centralizado).
         
         Procesa cada lectura individualmente con clasificación.
+        PASO 0: Ahora propaga timestamps precisos (sensor_ts, ingested_ts, sequence)
         """
         count = 0
         for row in rows:
@@ -73,10 +74,18 @@ class BatchReadingHandler:
             value = float(row["value"])
             device_ts = self._parse_device_timestamp(row.get("device_timestamp"))
             
+            # PASO 0: Extraer timestamps precisos si están disponibles
+            sensor_ts = row.get("sensor_ts")      # Unix epoch preciso del sensor
+            ingested_ts = row.get("ingested_ts")  # Unix epoch cuando llegó a ingesta
+            sequence = row.get("sequence")        # Número de secuencia
+            
             self._router.classify_and_route(
                 sensor_id=sensor_id,
                 value=value,
                 device_timestamp=device_ts,
+                sensor_ts=sensor_ts,
+                ingested_ts=ingested_ts,
+                sequence=sequence,
             )
             count += 1
         

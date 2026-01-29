@@ -27,6 +27,7 @@ from .endpoints import (
     single_ingest_router,
     batch_ingest_router,
     packet_ingest_router,
+    diagnostics_router,
 )
 
 
@@ -37,6 +38,7 @@ app.include_router(sensor_status_router)
 app.include_router(single_ingest_router)
 app.include_router(batch_ingest_router)
 app.include_router(packet_ingest_router)
+app.include_router(diagnostics_router)
 
 
 @app.on_event("startup")

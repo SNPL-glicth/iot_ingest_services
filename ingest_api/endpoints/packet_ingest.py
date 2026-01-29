@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 import logging
 from datetime import datetime, timezone
 from uuid import UUID
@@ -18,6 +19,7 @@ from ..schemas import DevicePacketIn, PacketIngestResult
 from ..ingest.handlers import BatchReadingHandler
 from ..ingest.sensor_resolver import resolve_sensor_id
 from ..debug import log_db_identity, should_force_persist, force_persist_probe
+from ..metrics import get_ingestion_metrics
 
 router = APIRouter(tags=["ingest"])
 logger = logging.getLogger(__name__)
@@ -45,8 +47,11 @@ def ingest_packet(
     - Solo publica datos limpios en el broker ML
     - Actualiza last_seen_at del dispositivo
     """
+    # PASO 0: Capturar ingested_ts INMEDIATAMENTE al recibir el request
+    ingested_ts = time.time()
+    
     if not payload.readings:
-        return PacketIngestResult(inserted=0, unknown_sensors=[])
+        return PacketIngestResult(inserted=0, unknown_sensors=[], ingested_ts=ingested_ts)
 
     limiter = get_rate_limiter()
     limiter.check_all(
@@ -68,8 +73,39 @@ def ingest_packet(
                 continue
 
             row = {"sensor_id": sensor_id, "value": float(r.value)}
-            if device_ts is not None:
+            
+            # PASO 0: Preservar timestamps precisos
+            # Prioridad: sensor_ts (preciso) > device_ts (legacy)
+            if r.sensor_ts is not None:
+                # Nuevo formato: timestamp Unix preciso del sensor
+                row["sensor_ts"] = r.sensor_ts
+                row["device_timestamp"] = datetime.fromtimestamp(r.sensor_ts, tz=timezone.utc)
+            elif device_ts is not None:
                 row["device_timestamp"] = device_ts
+            
+            # Agregar ingested_ts para tracking
+            row["ingested_ts"] = ingested_ts
+            
+            # Agregar sequence si viene
+            if r.sequence is not None:
+                row["sequence"] = r.sequence
+            
+            # FASE 2.1: Registrar métricas de timing para observabilidad
+            metrics_service = get_ingestion_metrics()
+            timing_result = metrics_service.record_reading(
+                sensor_id=sensor_id,
+                ingested_ts=ingested_ts,
+                sensor_ts=r.sensor_ts,
+                sequence=r.sequence,
+            )
+            
+            # Log warning si hay problemas de orden
+            if timing_result.get("out_of_order", False):
+                logger.warning(
+                    "OUT_OF_ORDER_READING sensor_id=%s seq=%s expected_after=%s",
+                    sensor_id, r.sequence, timing_result.get("last_sequence")
+                )
+            
             rows.append(row)
 
         if rows:
@@ -88,7 +124,15 @@ def ingest_packet(
             )
 
         db.commit()
-        return PacketIngestResult(inserted=len(rows), unknown_sensors=unknown)
+        
+        # Log resumen de timing
+        if rows:
+            logger.info(
+                "INGEST COMPLETE device=%s readings=%d ingested_ts=%.6f",
+                payload.device_uuid, len(rows), ingested_ts
+            )
+        
+        return PacketIngestResult(inserted=len(rows), unknown_sensors=unknown, ingested_ts=ingested_ts)
     except Exception as e:
         logger.exception("DB error in /ingest/packets err=%s", type(e).__name__)
         db.rollback()

@@ -11,6 +11,7 @@ notificaciones en alert_notifications.
 
 from __future__ import annotations
 import logging
+import time
 
 from datetime import datetime, timezone
 from enum import Enum
@@ -68,6 +69,9 @@ class ReadingRouter:
         value: float,
         device_timestamp: datetime | None = None,
         ingest_timestamp: datetime | None = None,
+        sensor_ts: float | None = None,      # PASO 0: Unix epoch preciso del sensor
+        ingested_ts: float | None = None,    # PASO 0: Unix epoch cuando llegó a ingesta
+        sequence: int | None = None,         # PASO 0: Número de secuencia
     ) -> PipelineType:
         """Procesa una lectura usando el SP centralizado.
 
@@ -90,6 +94,10 @@ class ReadingRouter:
         """
         if ingest_timestamp is None:
             ingest_timestamp = datetime.now(timezone.utc)
+        
+        # PASO 0: Capturar timing si no viene
+        if ingested_ts is None:
+            ingested_ts = time.time()
 
         # Guard rail - validación temprana antes de cualquier procesamiento
         guard_result = guard_reading(
@@ -151,17 +159,30 @@ class ReadingRouter:
                 # FIX: Reading requires sensor_type (str) and timestamp (float, not datetime)
                 # Obtener sensor_type de la BD si es necesario
                 sensor_type = self._get_sensor_type(sensor_id)
+                
+                # PASO 0: Usar sensor_ts preciso si está disponible
+                reading_ts = sensor_ts if sensor_ts is not None else ingest_timestamp.timestamp()
+                
                 reading = Reading(
                     sensor_id=sensor_id,
                     sensor_type=sensor_type,
                     value=float(value),
-                    timestamp=ingest_timestamp.timestamp(),  # Convert datetime to float
+                    timestamp=reading_ts,
                 )
                 self._broker.publish(reading)
-                self._logger.debug(
-                    "BROKER PUBLISHED sensor_id=%s value=%s",
-                    sensor_id, value
-                )
+                
+                # PASO 0: Log de timing para verificación
+                if sensor_ts is not None and ingested_ts is not None:
+                    latency_ms = (ingested_ts - sensor_ts) * 1000
+                    self._logger.debug(
+                        "BROKER PUBLISHED sensor_id=%s value=%s sensor_ts=%.6f ingested_ts=%.6f latency_ms=%.2f seq=%s",
+                        sensor_id, value, sensor_ts, ingested_ts, latency_ms, sequence
+                    )
+                else:
+                    self._logger.debug(
+                        "BROKER PUBLISHED sensor_id=%s value=%s ts=%.6f",
+                        sensor_id, value, reading_ts
+                    )
         except Exception as e:
             # No fallar si el broker falla - la lectura ya está persistida
             self._logger.warning(

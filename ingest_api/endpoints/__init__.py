@@ -8,6 +8,7 @@ from .sensor_status import router as sensor_status_router
 from .single_ingest import router as single_ingest_router
 from .batch_ingest import router as batch_ingest_router
 from .packet_ingest import router as packet_ingest_router
+from .diagnostics import router as diagnostics_router
 
 __all__ = [
     "health_router",
@@ -15,4 +16,5 @@ __all__ = [
     "single_ingest_router",
     "batch_ingest_router",
     "packet_ingest_router",
+    "diagnostics_router",
 ]

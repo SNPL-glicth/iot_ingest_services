@@ -22,11 +22,13 @@ class BulkSensorReadingsIn(BaseModel):
 class SensorReadingUuidIn(BaseModel):
     sensor_uuid: UUID
     value: float
+    sensor_ts: Optional[float] = None  # Unix epoch from sensor (precise timing)
+    sequence: Optional[int] = None     # Sequence number for ordering
 
 
 class DevicePacketIn(BaseModel):
     device_uuid: UUID
-    ts: Optional[datetime] = None
+    ts: Optional[datetime] = None  # Legacy: device timestamp as ISO string
     readings: List[SensorReadingUuidIn] = Field(default_factory=list)
 
 
@@ -36,6 +38,7 @@ class IngestResult(BaseModel):
 
 class PacketIngestResult(IngestResult):
     unknown_sensors: List[UUID] = Field(default_factory=list)
+    ingested_ts: Optional[float] = None  # When ingestion received the packet
 
 
 class SensorFinalState(str, Enum):
