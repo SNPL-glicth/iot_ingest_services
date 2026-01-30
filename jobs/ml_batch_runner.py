@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from iot_ingest_services.common.db import get_engine
 from iot_machine_learning.ml.baseline import BaselineConfig, predict_moving_average
@@ -24,6 +27,55 @@ class RunnerConfig:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _execute_with_retry(conn, query: str, params: dict, max_retries: int = 3) -> any:
+    """
+    Ejecuta consulta con retry con exponential backoff para manejar deadlocks.
+    
+    Args:
+        conn: Conexión SQLAlchemy
+        query: Query SQL a ejecutar
+        params: Parámetros de la consulta
+        max_retries: Número máximo de reintentos
+        
+    Returns:
+        Resultado de la consulta
+        
+    Raises:
+        OperationalError: Si falla después de todos los reintentos
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            return conn.execute(text(query), params)
+        except OperationalError as e:
+            # Verificar si es deadlock (error 1205)
+            if hasattr(e, 'orig') and hasattr(e.orig, 'args'):
+                if len(e.orig.args) > 0 and isinstance(e.orig.args[0], tuple):
+                    error_code = e.orig.args[0][0] if len(e.orig.args[0]) > 0 else None
+                else:
+                    error_code = None
+            else:
+                error_code = None
+                
+            if error_code == 1205 and attempt < max_retries:
+                # Deadlock detectado, esperar con exponential backoff
+                delay = min(1000 * (2 ** (attempt - 1)), 5000)  # 1s, 2s, 4s max
+                jitter = random.uniform(0, delay * 0.1)  # 10% jitter
+                total_delay = (delay + jitter) / 1000.0
+                
+                logging.warning(
+                    f"Deadlock detectado (intento {attempt}/{max_retries}), "
+                    f"reintentando en {total_delay:.2f}s..."
+                )
+                time.sleep(total_delay)
+                continue
+            
+            # Si no es deadlock o se acabaron los reintentos, relanzar error
+            logging.error(f"Error ejecutando consulta (intento {attempt}/{max_retries}): {e}")
+            raise
+    
+    raise OperationalError("Max retries exceeded", {}, None)
 
 
 def _ensure_watermark(conn, sensor_id: int) -> None:
@@ -53,10 +105,13 @@ def _get_last_reading_id(conn, sensor_id: int) -> int | None:
 
 
 def _get_sensor_max_reading_id(conn, sensor_id: int) -> int | None:
-    row = conn.execute(
-        text("SELECT MAX(id) FROM dbo.sensor_readings WHERE sensor_id = :sensor_id"),
-        {"sensor_id": sensor_id},
-    ).fetchone()
+    # FIX DEADLOCK: Usar retry con exponential backoff
+    result = _execute_with_retry(
+        conn,
+        "SELECT MAX(id) FROM dbo.sensor_readings WHERE sensor_id = :sensor_id",
+        {"sensor_id": sensor_id}
+    )
+    row = result.fetchone()
     if not row or row[0] is None:
         return None
     return int(row[0])
@@ -404,6 +459,15 @@ def run_once(cfg: RunnerConfig) -> None:
 
 
 def main() -> None:
+    # Configurar logging para ver mensajes de deadlock
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+        ]
+    )
+    
     p = argparse.ArgumentParser(description="ML batch runner (predictions + ml_events) with watermarks")
     p.add_argument("--window", type=int, default=60)
     p.add_argument("--horizon-minutes", type=int, default=10)
@@ -421,11 +485,22 @@ def main() -> None:
         once=bool(args.once),
     )
 
+    logging.info("ML Batch Runner iniciado con deadlock retry")
+    logging.info(f"Config: window={cfg.window}, horizon={cfg.horizon_minutes}min, sleep={cfg.sleep_seconds}s")
+
     while True:
-        run_once(cfg)
-        if cfg.once:
-            return
-        time.sleep(cfg.sleep_seconds)
+        try:
+            run_once(cfg)
+            if cfg.once:
+                return
+            logging.info(f"Iteración completada, esperando {cfg.sleep_seconds}s...")
+            time.sleep(cfg.sleep_seconds)
+        except Exception as e:
+            logging.error(f"Error en iteración: {e}")
+            if cfg.once:
+                raise
+            logging.info("Continuando con siguiente iteración...")
+            time.sleep(cfg.sleep_seconds)
 
 
 if __name__ == "__main__":
