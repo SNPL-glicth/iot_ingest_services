@@ -1,6 +1,8 @@
 """Handler para ingesta en lote.
 
 Procesa múltiples lecturas usando BatchInserter para optimizar throughput.
+
+FIX 2026-02-02: Integración con resiliencia (deduplicación, DLQ, retry).
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from sqlalchemy.orm import Session
 from iot_machine_learning.ml_service.reading_broker import ReadingBroker
 
 from ..router import ReadingRouter
+from ..resilience import MessageDeduplicator, DeadLetterQueue
 from ...batch_inserter import get_batch_inserter, BatchInserter
 
 
@@ -27,7 +30,7 @@ class BatchReadingHandler:
     1. Modo SP (default): Usa ReadingRouter que delega al SP centralizado
     2. Modo BatchInserter: Usa buffer con flush periódico para alto throughput
     
-    El modo se selecciona según la configuración y disponibilidad del BatchInserter.
+    FIX 2026-02-02: Ahora soporta deduplicación y DLQ.
     """
     
     def __init__(
@@ -35,10 +38,14 @@ class BatchReadingHandler:
         db: Session, 
         broker: ReadingBroker,
         use_batch_inserter: bool = False,
+        deduplicator: Optional[MessageDeduplicator] = None,
+        dlq: Optional[DeadLetterQueue] = None,
     ) -> None:
         self._db = db
         self._broker = broker
-        self._router = ReadingRouter(db, broker)
+        self._dedup = deduplicator
+        self._dlq = dlq
+        self._router = ReadingRouter(db, broker, deduplicator, dlq)
         self._use_batch_inserter = use_batch_inserter
     
     def ingest(

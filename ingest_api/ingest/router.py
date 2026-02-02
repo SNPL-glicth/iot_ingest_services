@@ -5,24 +5,27 @@ Cada lectura se clasifica UNA VEZ y se enruta a exactamente UN pipeline.
 
 FIX 2026-01-16: Ahora usa el SP sp_insert_reading_and_check_threshold para TODA
 la lógica de inserción, evaluación de umbrales, alertas y notificaciones.
-Esto garantiza consistencia con el backend NestJS y la creación correcta de
-notificaciones en alert_notifications.
+
+FIX 2026-02-02: Agregado retry con backoff, deduplicación y DLQ.
 """
 
 from __future__ import annotations
 import logging
 import time
+from typing import Optional
 
 from datetime import datetime, timezone
 from enum import Enum
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, DBAPIError
 
-from iot_machine_learning.ml_service.reading_broker import ReadingBroker
+from iot_machine_learning.ml_service.reading_broker import ReadingBroker, Reading
 
 from .common.validation import is_suspicious_zero_reading, log_suspicious_reading
 from .common.guards import guard_reading, ValidationResult
+from .resilience import MessageDeduplicator, DeadLetterQueue, retry_with_backoff, RetryConfig
 
 
 class PipelineType(Enum):
@@ -34,18 +37,56 @@ class PipelineType(Enum):
     SP_HANDLED = "sp_handled"  # Nueva: manejado por el SP
 
 
+# Configuración de retry para el SP
+SP_RETRY_CONFIG = RetryConfig(
+    max_attempts=3,
+    base_delay=0.5,
+    max_delay=5.0,
+    retryable_exceptions=(OperationalError, DBAPIError),
+)
+
+
 class ReadingRouter:
     """Router central que clasifica y enruta lecturas a los pipelines.
     
     FIX: Ahora delega TODA la lógica al SP sp_insert_reading_and_check_threshold
     que maneja inserción, umbrales, alertas, notificaciones y delta detector.
+    
+    FIX 2026-02-02: Agregado:
+    - Retry con backoff exponencial para el SP
+    - Deduplicación de mensajes con Redis
+    - Dead Letter Queue para mensajes fallidos
     """
 
-    def __init__(self, db: Session, broker: ReadingBroker) -> None:
+    def __init__(
+        self, 
+        db: Session, 
+        broker: ReadingBroker,
+        deduplicator: Optional[MessageDeduplicator] = None,
+        dlq: Optional[DeadLetterQueue] = None,
+    ) -> None:
         self._db = db
         self._broker = broker
+        self._dedup = deduplicator
+        self._dlq = dlq
         self._logger = logging.getLogger(__name__)
         self._sensor_type_cache: dict[int, str] = {}
+        
+        # Stats
+        self._total_processed = 0
+        self._total_duplicates = 0
+        self._total_errors = 0
+
+    @property
+    def stats(self) -> dict:
+        """Estadísticas del router."""
+        return {
+            "total_processed": self._total_processed,
+            "total_duplicates": self._total_duplicates,
+            "total_errors": self._total_errors,
+            "dedup": self._dedup.stats if self._dedup else None,
+            "dlq": self._dlq.stats if self._dlq else None,
+        }
 
     def _get_sensor_type(self, sensor_id: int) -> str:
         """Obtiene el tipo de sensor desde cache o BD."""
@@ -62,6 +103,54 @@ class ReadingRouter:
             return sensor_type
         except Exception:
             return "unknown"
+    
+    def _execute_sp_with_retry(
+        self,
+        sensor_id: int,
+        value: float,
+        device_timestamp: Optional[datetime],
+    ) -> None:
+        """Ejecuta el SP con retry y backoff exponencial."""
+        last_error: Optional[Exception] = None
+        
+        for attempt in range(1, SP_RETRY_CONFIG.max_attempts + 1):
+            try:
+                self._db.execute(
+                    text(
+                        """
+                        EXEC sp_insert_reading_and_check_threshold 
+                            @p_sensor_id = :sensor_id, 
+                            @p_value = :value,
+                            @p_device_timestamp = :device_ts
+                        """
+                    ),
+                    {
+                        "sensor_id": sensor_id,
+                        "value": float(value),
+                        "device_ts": device_timestamp,
+                    },
+                )
+                return  # Éxito
+                
+            except SP_RETRY_CONFIG.retryable_exceptions as e:
+                last_error = e
+                
+                if attempt == SP_RETRY_CONFIG.max_attempts:
+                    self._logger.error(
+                        "SP_RETRY_EXHAUSTED sensor_id=%s attempts=%d err=%s",
+                        sensor_id, attempt, e
+                    )
+                    raise
+                
+                delay = SP_RETRY_CONFIG.calculate_delay(attempt)
+                self._logger.warning(
+                    "SP_RETRY sensor_id=%s attempt=%d/%d delay=%.2fs err=%s",
+                    sensor_id, attempt, SP_RETRY_CONFIG.max_attempts, delay, e
+                )
+                time.sleep(delay)
+        
+        if last_error:
+            raise last_error
 
     def classify_and_route(
         self,
@@ -72,6 +161,7 @@ class ReadingRouter:
         sensor_ts: float | None = None,      # PASO 0: Unix epoch preciso del sensor
         ingested_ts: float | None = None,    # PASO 0: Unix epoch cuando llegó a ingesta
         sequence: int | None = None,         # PASO 0: Número de secuencia
+        msg_id: str | None = None,           # ID único para deduplicación
     ) -> PipelineType:
         """Procesa una lectura usando el SP centralizado.
 
@@ -111,30 +201,35 @@ class ReadingRouter:
                 "INGEST REJECTED sensor_id=%s value=%s reason=%s details=%s",
                 sensor_id, value, guard_result.reason, guard_result.details,
             )
+            # Enviar a DLQ para análisis
+            if self._dlq:
+                self._dlq.send(
+                    payload={"sensor_id": sensor_id, "value": value},
+                    error=guard_result.reason,
+                    error_type="validation_error",
+                    source="router",
+                    sensor_id=sensor_id,
+                )
+            return PipelineType.SP_HANDLED
+
+        # Deduplicación: verificar si ya procesamos este mensaje
+        msg_id = msg_id or f"{sensor_id}:{sensor_ts or ingested_ts:.6f}:{value:.6f}"
+        if self._dedup and self._dedup.is_duplicate(msg_id):
+            self._total_duplicates += 1
+            self._logger.debug(
+                "INGEST DUPLICATE sensor_id=%s msg_id=%s",
+                sensor_id, msg_id
+            )
             return PipelineType.SP_HANDLED
 
         # Detectar lecturas sospechosas con valor 0.00000
         if is_suspicious_zero_reading(value):
             log_suspicious_reading(sensor_id, value, reason="exact_zero_value")
 
-        # FIX: Usar el SP para TODA la lógica
-        # El SP maneja: inserción, umbrales, alertas, notificaciones, delta detector
+        # Ejecutar SP con retry
         try:
-            self._db.execute(
-                text(
-                    """
-                    EXEC sp_insert_reading_and_check_threshold 
-                        @p_sensor_id = :sensor_id, 
-                        @p_value = :value,
-                        @p_device_timestamp = :device_ts
-                    """
-                ),
-                {
-                    "sensor_id": sensor_id,
-                    "value": float(value),
-                    "device_ts": device_timestamp,
-                },
-            )
+            self._execute_sp_with_retry(sensor_id, value, device_timestamp)
+            self._total_processed += 1
             self._logger.info(
                 "INGEST SP_HANDLED sensor_id=%s value=%s ts=%s",
                 sensor_id,
@@ -142,6 +237,7 @@ class ReadingRouter:
                 ingest_timestamp.isoformat(),
             )
         except Exception as e:
+            self._total_errors += 1
             self._logger.exception(
                 "INGEST ERROR SP sensor_id=%s value=%s ts=%s err=%s",
                 sensor_id,
@@ -149,48 +245,66 @@ class ReadingRouter:
                 ingest_timestamp.isoformat(),
                 type(e).__name__,
             )
+            # Enviar a DLQ
+            if self._dlq:
+                self._dlq.send(
+                    payload={"sensor_id": sensor_id, "value": value, "device_ts": str(device_timestamp)},
+                    error=str(e),
+                    error_type="sp_error",
+                    source="router",
+                    sensor_id=sensor_id,
+                    msg_id=msg_id,
+                )
             raise
 
         # Publicar al broker para ML (si está configurado)
-        # El SP ya insertó la lectura, solo notificamos al broker
+        self._publish_to_broker(
+            sensor_id=sensor_id,
+            value=value,
+            sensor_ts=sensor_ts,
+            ingested_ts=ingested_ts,
+            ingest_timestamp=ingest_timestamp,
+            sequence=sequence,
+        )
+
+        return PipelineType.SP_HANDLED
+    
+    def _publish_to_broker(
+        self,
+        sensor_id: int,
+        value: float,
+        sensor_ts: Optional[float],
+        ingested_ts: Optional[float],
+        ingest_timestamp: datetime,
+        sequence: Optional[int],
+    ) -> None:
+        """Publica lectura al broker ML."""
+        if not self._broker:
+            return
+        
         try:
-            if self._broker:
-                from iot_machine_learning.ml_service.reading_broker import Reading
-                # FIX: Reading requires sensor_type (str) and timestamp (float, not datetime)
-                # Obtener sensor_type de la BD si es necesario
-                sensor_type = self._get_sensor_type(sensor_id)
-                
-                # PASO 0: Usar sensor_ts preciso si está disponible
-                reading_ts = sensor_ts if sensor_ts is not None else ingest_timestamp.timestamp()
-                
-                reading = Reading(
-                    sensor_id=sensor_id,
-                    sensor_type=sensor_type,
-                    value=float(value),
-                    timestamp=reading_ts,
+            sensor_type = self._get_sensor_type(sensor_id)
+            reading_ts = sensor_ts if sensor_ts is not None else ingest_timestamp.timestamp()
+            
+            reading = Reading(
+                sensor_id=sensor_id,
+                sensor_type=sensor_type,
+                value=float(value),
+                timestamp=reading_ts,
+            )
+            self._broker.publish(reading)
+            
+            if sensor_ts is not None and ingested_ts is not None:
+                latency_ms = (ingested_ts - sensor_ts) * 1000
+                self._logger.debug(
+                    "BROKER PUBLISHED sensor_id=%s value=%s latency_ms=%.2f seq=%s",
+                    sensor_id, value, latency_ms, sequence
                 )
-                self._broker.publish(reading)
-                
-                # PASO 0: Log de timing para verificación
-                if sensor_ts is not None and ingested_ts is not None:
-                    latency_ms = (ingested_ts - sensor_ts) * 1000
-                    self._logger.debug(
-                        "BROKER PUBLISHED sensor_id=%s value=%s sensor_ts=%.6f ingested_ts=%.6f latency_ms=%.2f seq=%s",
-                        sensor_id, value, sensor_ts, ingested_ts, latency_ms, sequence
-                    )
-                else:
-                    self._logger.debug(
-                        "BROKER PUBLISHED sensor_id=%s value=%s ts=%.6f",
-                        sensor_id, value, reading_ts
-                    )
         except Exception as e:
-            # No fallar si el broker falla - la lectura ya está persistida
             self._logger.warning(
                 "BROKER PUBLISH FAILED sensor_id=%s err=%s: %s",
                 sensor_id,
                 type(e).__name__,
                 str(e),
             )
-
-        return PipelineType.SP_HANDLED
 

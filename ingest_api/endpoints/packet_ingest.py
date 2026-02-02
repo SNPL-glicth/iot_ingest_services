@@ -1,4 +1,7 @@
-"""Endpoint para ingesta de paquetes por dispositivo (recomendado)."""
+"""Endpoint para ingesta de paquetes por dispositivo (recomendado).
+
+FIX 2026-02-02: Integración con resiliencia (deduplicación, DLQ).
+"""
 
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from ..rate_limiter import get_rate_limiter, get_client_ip
 from ..schemas import DevicePacketIn, PacketIngestResult
 from ..ingest.handlers import BatchReadingHandler
 from ..ingest.sensor_resolver import resolve_sensor_id
+from ..ingest.resilience import get_resilience_components
 from ..debug import log_db_identity, should_force_persist, force_persist_probe
 from ..metrics import get_ingestion_metrics
 
@@ -110,7 +114,8 @@ def ingest_packet(
 
         if rows:
             broker = get_broker()
-            handler = BatchReadingHandler(db, broker)
+            dedup, dlq = get_resilience_components()
+            handler = BatchReadingHandler(db, broker, deduplicator=dedup, dlq=dlq)
             handler.ingest(rows)
 
         log_db_identity(db)

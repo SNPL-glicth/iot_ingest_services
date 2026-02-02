@@ -1,15 +1,25 @@
 """Receptor MQTT principal.
 
 Usa paho-mqtt para recibir lecturas y las procesa con el SP de dominio.
+
+FIX 2026-02-02: Integración con resiliencia (deduplicación, DLQ).
+FIX 2026-02-02: Uso de orjson para parsing JSON más rápido.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
 from typing import Optional
+
+# Usar orjson si está disponible (3-10x más rápido que json estándar)
+try:
+    import orjson
+    ORJSON_AVAILABLE = True
+except ImportError:
+    import json
+    ORJSON_AVAILABLE = False
 
 try:
     import paho.mqtt.client as mqtt
@@ -20,6 +30,7 @@ except ImportError:
 from .validators import validate_mqtt_reading
 from .connections import DatabaseConnection, RedisConnection
 from .processor import ReadingProcessor
+from ..ingest.resilience import get_deduplicator, get_dlq, MessageDeduplicator, DeadLetterQueue
 
 logger = logging.getLogger(__name__)
 
@@ -147,29 +158,72 @@ class MQTTReceiver:
         try:
             data = self._parse_json(msg.payload, msg.topic)
             if data is None:
+                # Enviar a DLQ
+                dlq = get_dlq()
+                if dlq:
+                    dlq.send(
+                        payload=msg.payload,
+                        error="Invalid JSON",
+                        error_type="parse_error",
+                        source="mqtt",
+                    )
                 return
             
             validation = validate_mqtt_reading(data)
             if not validation.valid:
                 logger.warning("[MQTT] Validation failed: %s", validation.error)
                 self._stats.failed += 1
+                # Enviar a DLQ
+                dlq = get_dlq()
+                if dlq:
+                    dlq.send(
+                        payload=data,
+                        error=validation.error,
+                        error_type="validation_error",
+                        source="mqtt",
+                    )
                 return
+            
+            # Deduplicación
+            dedup = get_deduplicator()
+            if dedup:
+                msg_id = validation.payload.msg_id or dedup.generate_msg_id(
+                    sensor_id=validation.payload.sensor_id_int or 0,
+                    timestamp=validation.payload.timestamp_float,
+                    value=validation.payload.value,
+                )
+                if dedup.is_duplicate(msg_id):
+                    self._stats.duplicates += 1
+                    logger.debug("[MQTT] Duplicate msg_id=%s", msg_id)
+                    return
             
             self._processor.process(validation.payload)
             self._stats.processed += 1
             
-            if self._stats.processed % 10 == 0:
+            if self._stats.processed % 100 == 0:
                 logger.info("[MQTT] %s", self._stats)
             
         except Exception as e:
             logger.exception("[MQTT] Processing error: %s", e)
             self._stats.failed += 1
+            # Enviar a DLQ
+            dlq = get_dlq()
+            if dlq:
+                dlq.send(
+                    payload=str(msg.payload)[:1000],
+                    error=str(e),
+                    error_type="processing_error",
+                    source="mqtt",
+                )
     
     def _parse_json(self, payload: bytes, topic: str) -> Optional[dict]:
-        """Parsea payload JSON."""
+        """Parsea payload JSON usando orjson si está disponible."""
         try:
-            return json.loads(payload.decode("utf-8"))
-        except json.JSONDecodeError as e:
+            if ORJSON_AVAILABLE:
+                return orjson.loads(payload)
+            else:
+                return json.loads(payload.decode("utf-8"))
+        except Exception as e:
             logger.warning("[MQTT] Invalid JSON: %s (topic=%s)", e, topic)
             self._stats.failed += 1
             return None
@@ -218,10 +272,11 @@ class ReceiverStats:
         self.received = 0
         self.processed = 0
         self.failed = 0
+        self.duplicates = 0
         self.last_message_at: float = 0
     
     def __str__(self) -> str:
-        return f"Stats: received={self.received} processed={self.processed} failed={self.failed}"
+        return f"Stats: received={self.received} processed={self.processed} failed={self.failed} duplicates={self.duplicates}"
 
 
 # Singleton

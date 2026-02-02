@@ -1,13 +1,12 @@
 """Validaciones comunes para los pipelines.
 
+Refactorizado 2026-02-02: Separado en módulos <180 líneas.
+- threshold_queries.py: Consultas de umbrales
+- suspicious_readings.py: Detección de lecturas sospechosas
+
 MODELO DE ESTADOS:
 Todas las validaciones usan SensorStateManager como único punto de decisión
 para determinar si un sensor puede generar WARNING/ALERT.
-
-Regla de dominio:
-- Sensor en INITIALIZING → NUNCA genera eventos
-- Sensor en STALE → NUNCA genera eventos  
-- Sensor en NORMAL → puede generar WARNING/ALERT
 """
 
 from __future__ import annotations
@@ -20,65 +19,12 @@ from sqlalchemy.orm import Session
 
 from .physical_ranges import PhysicalRange, get_physical_range
 from .delta_utils import DeltaThreshold, LastReading, get_delta_threshold, get_last_reading, check_delta_spike
+from .threshold_queries import get_warning_thresholds, is_value_within_warning_range
+from .suspicious_readings import is_suspicious_zero_reading, log_suspicious_reading
 
-# FIX MODELO DE ESTADOS: Importar gestor de estado operacional
 from iot_ingest_services.ingest_api.classification import SensorStateManager
 
 logger = logging.getLogger(__name__)
-
-# FIX 1: Tipos de sensor donde 0.00000 exacto es sospechoso
-_SUSPICIOUS_ZERO_SENSOR_TYPES = frozenset({
-    "temperature",
-    "humidity", 
-    "pressure",
-    "ph",
-})
-
-
-def is_suspicious_zero_reading(
-    value: float,
-    sensor_type: Optional[str] = None,
-    tolerance: float = 1e-6,
-) -> bool:
-    """Detecta si un valor 0.00000 es sospechoso según el tipo de sensor.
-    
-    Para sensores de temperatura, humedad, presión, pH, un valor exactamente 0
-    es muy improbable en condiciones reales y puede indicar:
-    - Sensor desconectado
-    - Error de lectura
-    - Placeholder del simulador
-    
-    Args:
-        value: Valor de la lectura
-        sensor_type: Tipo de sensor (opcional)
-        tolerance: Tolerancia para considerar "cero exacto"
-    
-    Returns:
-        True si el valor es sospechoso, False si es válido
-    """
-    if abs(value) > tolerance:
-        return False
-    
-    # Si no tenemos tipo de sensor, asumimos que podría ser sospechoso
-    if sensor_type is None:
-        return True
-    
-    # Solo marcar como sospechoso para tipos específicos
-    normalized_type = sensor_type.lower().strip()
-    return normalized_type in _SUSPICIOUS_ZERO_SENSOR_TYPES
-
-
-def log_suspicious_reading(
-    sensor_id: int,
-    value: float,
-    sensor_type: Optional[str] = None,
-    reason: str = "zero_value",
-) -> None:
-    """Registra una lectura sospechosa para análisis posterior."""
-    logger.warning(
-        f"SUSPICIOUS_READING sensor_id={sensor_id} value={value} "
-        f"sensor_type={sensor_type} reason={reason}"
-    )
 
 
 def validate_alert_data(
@@ -99,75 +45,6 @@ def validate_alert_data(
         return False, None, f"Valor {value} no viola el rango físico [{physical_range.min_value}, {physical_range.max_value}]"
 
     return True, physical_range, f"Valor {value} fuera de rango físico [{physical_range.min_value}, {physical_range.max_value}]"
-
-
-# FIX RAÍZ: Constantes para validación de warm-up
-MIN_READINGS_FOR_DELTA = 3  # Mínimo de lecturas recientes para evaluar delta spike
-WARMUP_WINDOW_HOURS = 2  # Ventana de tiempo para contar lecturas de warm-up
-
-
-def _get_recent_reading_count(db: Session, sensor_id: int, hours: int = WARMUP_WINDOW_HOURS) -> int:
-    """Cuenta lecturas recientes del sensor para validación de warm-up."""
-    from sqlalchemy import text
-    try:
-        row = db.execute(
-            text(
-                """
-                SELECT COUNT(*) as cnt
-                FROM dbo.sensor_readings
-                WHERE sensor_id = :sensor_id
-                  AND timestamp >= DATEADD(hour, -:hours, GETDATE())
-                """
-            ),
-            {"sensor_id": sensor_id, "hours": hours},
-        ).fetchone()
-        return int(row[0]) if row and row[0] else 0
-    except Exception:
-        return 0
-
-
-def _get_warning_thresholds(db: Session, sensor_id: int) -> tuple[Optional[float], Optional[float]]:
-    """Obtiene los umbrales WARNING del usuario para el sensor.
-    
-    Returns:
-        (warning_min, warning_max) o (None, None) si no hay umbrales configurados
-    """
-    from sqlalchemy import text
-    try:
-        row = db.execute(
-            text(
-                """
-                SELECT threshold_value_min, threshold_value_max
-                FROM dbo.alert_thresholds
-                WHERE sensor_id = :sensor_id
-                  AND is_active = 1
-                  AND severity = 'warning'
-                  AND condition_type = 'out_of_range'
-                ORDER BY id ASC
-                """
-            ),
-            {"sensor_id": sensor_id},
-        ).fetchone()
-        
-        if not row:
-            return None, None
-        
-        warning_min = float(row[0]) if row[0] is not None else None
-        warning_max = float(row[1]) if row[1] is not None else None
-        return warning_min, warning_max
-    except Exception:
-        return None, None
-
-
-def _is_value_within_warning_range(value: float, warning_min: Optional[float], warning_max: Optional[float]) -> bool:
-    """Verifica si el valor está dentro del rango WARNING del usuario."""
-    if warning_min is None and warning_max is None:
-        return False
-    if warning_min is not None and value < warning_min:
-        return False
-    if warning_max is not None and value > warning_max:
-        return False
-    return True
 
 
 def validate_warning_data(
@@ -213,8 +90,8 @@ def validate_warning_data(
     # PASO 1: REGLA DE DOMINIO - Verificar umbrales del usuario
     # Si el valor está dentro del rango WARNING, NO puede haber delta spike.
     # =========================================================================
-    warning_min, warning_max = _get_warning_thresholds(db, sensor_id)
-    if _is_value_within_warning_range(value, warning_min, warning_max):
+    warning_min, warning_max = get_warning_thresholds(db, sensor_id)
+    if is_value_within_warning_range(value, warning_min, warning_max):
         return False, None, "Valor dentro del rango WARNING del usuario; delta spike no aplica"
 
     # PASO 2: Verificar que existe lectura previa RECIENTE

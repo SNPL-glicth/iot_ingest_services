@@ -1,9 +1,12 @@
-"""Metrics module for ingestion observability."""
+"""Metrics module for ingestion observability.
 
-from .ingestion_metrics import (
+Refactorizado 2026-02-02: Separado en módulos <180 líneas.
+"""
+
+from .sensor_stats import SensorTimingStats
+from .aggregator import (
     IngestionMetricsService,
     IngestionMetrics,
-    SensorTimingStats,
     get_ingestion_metrics,
 )
 

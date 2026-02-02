@@ -1,6 +1,9 @@
 """Validadores de payloads MQTT para ingesta.
 
 Valida y transforma mensajes MQTT al formato interno.
+
+FIX 2026-02-02: Corregido parsing repetido de timestamp. Ahora se parsea
+una sola vez en el validator y se cachea el resultado.
 """
 
 from __future__ import annotations
@@ -8,10 +11,10 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, root_validator
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +46,6 @@ class MQTTReadingPayload(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     msg_id: Optional[str] = Field(default=None, alias="msgId")
     
-    class Config:
-        populate_by_name = True
-    
     @validator("value")
     def validate_value(cls, v):
         if v != v:  # NaN check
@@ -55,6 +55,14 @@ class MQTTReadingPayload(BaseModel):
         if not (-1e12 < v < 1e12):
             raise ValueError("Value out of range")
         return v
+    
+    # Campos cacheados (se calculan una vez en root_validator)
+    _parsed_ts: Optional[float] = None
+    _parsed_dt: Optional[datetime] = None
+    
+    class Config:
+        populate_by_name = True
+        underscore_attrs_are_private = True
     
     @validator("timestamp")
     def validate_timestamp(cls, v):
@@ -71,6 +79,20 @@ class MQTTReadingPayload(BaseModel):
             return v
         except Exception as e:
             raise ValueError(f"Invalid timestamp format: {e}")
+    
+    @root_validator(pre=False)
+    def cache_parsed_timestamp(cls, values):
+        """Parsea timestamp una sola vez y cachea el resultado."""
+        ts_str = values.get("timestamp")
+        if ts_str:
+            try:
+                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                values["_parsed_dt"] = dt
+                values["_parsed_ts"] = dt.timestamp()
+            except Exception:
+                values["_parsed_ts"] = time.time()
+                values["_parsed_dt"] = datetime.now(timezone.utc)
+        return values
     
     @validator("sensor_id")
     def validate_sensor_id(cls, v):
@@ -114,30 +136,38 @@ class MQTTReadingPayload(BaseModel):
     
     @property
     def timestamp_float(self) -> float:
-        """Convierte timestamp ISO a float."""
+        """Retorna timestamp como float Unix epoch (cacheado)."""
+        if self._parsed_ts is not None:
+            return self._parsed_ts
+        # Fallback si no se cacheó
         try:
             dt = datetime.fromisoformat(self.timestamp.replace("Z", "+00:00"))
             return dt.timestamp()
         except Exception:
             return time.time()
     
+    @property
+    def timestamp_datetime(self) -> datetime:
+        """Retorna timestamp como datetime (cacheado)."""
+        if self._parsed_dt is not None:
+            return self._parsed_dt
+        # Fallback si no se cacheó
+        try:
+            return datetime.fromisoformat(self.timestamp.replace("Z", "+00:00"))
+        except Exception:
+            return datetime.now(timezone.utc)
+    
     def to_ingest_row(self) -> dict[str, Any]:
         """Convierte a formato de fila de ingesta."""
-        row = {
+        return {
             "sensor_id": self.sensor_id_int,
             "value": self.value,
             "ingested_ts": time.time(),
+            "sequence": self.sequence,
+            "sensor_ts": self.timestamp_float,
+            "device_timestamp": self.timestamp_datetime,
+            "msg_id": self.msg_id,
         }
-        
-        if self.sequence is not None:
-            row["sequence"] = self.sequence
-        
-        row["sensor_ts"] = self.timestamp_float
-        row["device_timestamp"] = datetime.fromisoformat(
-            self.timestamp.replace("Z", "+00:00")
-        )
-        
-        return row
 
 
 @dataclass
