@@ -15,10 +15,12 @@ Estructura modular:
 FLUJO MQTT (cuando FF_MQTT_INGEST_ENABLED=true):
   Simulador/Dispositivo
   → MQTT topic: iot/sensors/{id}/readings
-  → mqtt_receiver
-  → mqtt_bridge
-  → Redis Stream readings:raw
-  → flujo actual SIN CAMBIOS
+  → simple_receiver (o modular_receiver si FF_MQTT_MODULAR_RECEIVER=true)
+  → SP sp_insert_reading_and_check_threshold
+    → INSERT sensor_readings
+    → Evalúa umbrales → alerts, alert_notifications
+    → Detecta delta spike → ml_events
+  → Redis Stream readings:validated (opcional, para ML)
 
 EJECUCIÓN:
   uvicorn ingest_api.main:app --reload --port 8001
@@ -65,7 +67,7 @@ app.include_router(diagnostics_router)
 @app.on_event("startup")
 async def startup_event():
     """Inicializa el BatchInserter y opcionalmente el receptor MQTT."""
-    global _mqtt_receiver
+    
     logger = logging.getLogger(__name__)
     
     try:
@@ -82,26 +84,32 @@ async def startup_event():
     
     # MQTT Ingest: Canal principal cuando está habilitado
     if os.getenv("FF_MQTT_INGEST_ENABLED", "false").lower() == "true":
+        use_modular = os.getenv("FF_MQTT_MODULAR_RECEIVER", "false").lower() == "true"
+        
         try:
-            # Usar receptor simple (paho-mqtt directo → BD)
-            from .mqtt.simple_receiver import start_simple_receiver, get_simple_receiver
-            
-            started = start_simple_receiver()
-            if started:
-                receiver = get_simple_receiver()
-                logger.info(
-                    "[MQTT] Receptor SIMPLE iniciado - escuchando iot/sensors/+/readings → BD directa"
-                )
-                logger.info(
-                    "[MQTT] Broker: %s",
-                    receiver.stats.get("broker") if receiver else "N/A"
-                )
+            if use_modular:
+                # Usar receptor modular (arquitectura limpia)
+                from .core.receiver import start_modular_receiver, get_modular_receiver
+                
+                started = start_modular_receiver()
+                if started:
+                    receiver = get_modular_receiver()
+                    logger.info("[MQTT] Receptor MODULAR iniciado - arquitectura core/")
+                else:
+                    logger.warning("[MQTT] Receptor MODULAR no pudo iniciarse")
             else:
-                logger.warning(
-                    "[MQTT] Receptor SIMPLE no pudo iniciarse - verificar EMQX y BatchInserter"
-                )
+                # Usar receptor simple (paho-mqtt directo → SP)
+                from .mqtt.simple_receiver import start_simple_receiver, get_simple_receiver
+                
+                started = start_simple_receiver()
+                if started:
+                    receiver = get_simple_receiver()
+                    logger.info("[MQTT] Receptor SIMPLE iniciado → SP directo")
+                else:
+                    logger.warning("[MQTT] Receptor SIMPLE no pudo iniciarse")
+                    
         except ImportError as e:
-            logger.warning("[MQTT] Error importando simple_receiver: %s", e)
+            logger.warning("[MQTT] Error importando receptor: %s", e)
         except Exception as e:
             logger.exception("[MQTT] Error iniciando receptor MQTT: %s", e)
     else:
@@ -113,20 +121,28 @@ async def shutdown_event():
     """Detiene el BatchInserter, receptor MQTT y hace flush de datos pendientes."""
     logger = logging.getLogger(__name__)
     
-    # Detener receptor MQTT simple
+    # Detener receptor MQTT (modular o simple)
     try:
+        # Intentar detener receptor modular
+        from .core.receiver import stop_modular_receiver, get_modular_receiver
+        modular = get_modular_receiver()
+        if modular is not None:
+            stats = modular.stats
+            stop_modular_receiver()
+            logger.info("[MQTT] Receptor MODULAR detenido - processed=%d", stats.get("processed", 0))
+    except Exception:
+        pass
+    
+    try:
+        # Intentar detener receptor simple
         from .mqtt.simple_receiver import stop_simple_receiver, get_simple_receiver
-        receiver = get_simple_receiver()
-        if receiver is not None:
-            stats = receiver.stats
+        simple = get_simple_receiver()
+        if simple is not None:
+            stats = simple.stats
             stop_simple_receiver()
-            logger.info(
-                "[MQTT] Receptor SIMPLE detenido - processed=%d failed=%d",
-                stats.get("messages_processed", 0),
-                stats.get("messages_failed", 0),
-            )
+            logger.info("[MQTT] Receptor SIMPLE detenido - processed=%d", stats.get("messages_processed", 0))
     except Exception as e:
-        logger.error("[MQTT] Error deteniendo receptor MQTT: %s", e)
+        logger.error("[MQTT] Error deteniendo receptor: %s", e)
     
     try:
         shutdown_batch_inserter()
