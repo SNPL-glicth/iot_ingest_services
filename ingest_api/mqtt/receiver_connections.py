@@ -20,18 +20,14 @@ class DatabaseConnection:
         self._connected = False
     
     def connect(self) -> bool:
-        """Connect to database."""
+        """Connect to database using common config."""
         try:
-            from sqlalchemy import create_engine
+            # Import using the package name that uvicorn uses
+            from iot_ingest_services.common.db import get_engine
             
-            db_url = os.getenv("DATABASE_URL")
-            if not db_url:
-                logger.error("[DB] DATABASE_URL not set")
-                return False
-            
-            self._engine = create_engine(db_url, pool_pre_ping=True)
+            self._engine = get_engine()
             self._connected = True
-            logger.info("[DB] Connected successfully")
+            logger.info("[DB] Connected successfully via common.db")
             return True
             
         except Exception as e:

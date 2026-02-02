@@ -62,7 +62,6 @@ class MQTTReadingPayload(BaseModel):
     
     class Config:
         populate_by_name = True
-        underscore_attrs_are_private = True
     
     @validator("timestamp")
     def validate_timestamp(cls, v):
