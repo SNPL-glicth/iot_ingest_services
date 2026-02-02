@@ -19,9 +19,9 @@ from ..auth import require_device_key_dependency, validate_device_access
 from ..broker import get_broker
 from ..rate_limiter import get_rate_limiter, get_client_ip
 from ..schemas import DevicePacketIn, PacketIngestResult
-from ..ingest.handlers import BatchReadingHandler
-from ..ingest.sensor_resolver import resolve_sensor_id
-from ..ingest.resilience import get_resilience_components
+from ..pipelines.handlers import BatchReadingHandler
+from ..pipelines.sensor_resolver import resolve_sensor_id
+from ..pipelines.resilience import get_resilience_components
 from ..debug import log_db_identity, should_force_persist, force_persist_probe
 from ..metrics import get_ingestion_metrics
 

@@ -14,7 +14,23 @@ from typing import Optional
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
-from iot_machine_learning.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
+# Import condicional para evitar dependencia circular
+try:
+    from iot_machine_learning.ml_service.utils.numeric_precision import safe_float, is_valid_sensor_value
+except ImportError:
+    # Fallback si ML no está disponible
+    def safe_float(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+    
+    def is_valid_sensor_value(value):
+        try:
+            f = float(value)
+            return not (f != f)  # Check for NaN
+        except (TypeError, ValueError):
+            return False
 
 from .models import ReadingClass, ClassifiedReading, PhysicalRange
 from .state_manager import SensorStateManager

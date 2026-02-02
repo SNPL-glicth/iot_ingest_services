@@ -14,7 +14,7 @@ from ..auth import require_api_key
 from ..broker import get_broker
 from ..rate_limiter import get_rate_limiter, get_client_ip
 from ..schemas import BulkSensorReadingsIn, IngestResult
-from ..ingest.handlers import BatchReadingHandler
+from ..pipelines.handlers import BatchReadingHandler
 from ..debug import log_db_identity, should_force_persist, force_persist_probe
 
 router = APIRouter(tags=["ingest"])

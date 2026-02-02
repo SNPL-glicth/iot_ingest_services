@@ -1,18 +1,15 @@
 """Metrics module for ingestion observability.
 
-Refactorizado 2026-02-02: Separado en módulos <180 líneas.
+Refactored 2026-02-02: Split into modular files.
 """
 
-from .sensor_stats import SensorTimingStats
-from .aggregator import (
-    IngestionMetricsService,
-    IngestionMetrics,
-    get_ingestion_metrics,
-)
+from .timing_stats import SensorTimingStats
+from .models import IngestionMetrics
+from .service import IngestionMetricsService, get_ingestion_metrics
 
 __all__ = [
-    "IngestionMetricsService",
-    "IngestionMetrics",
     "SensorTimingStats",
+    "IngestionMetrics",
+    "IngestionMetricsService",
     "get_ingestion_metrics",
 ]

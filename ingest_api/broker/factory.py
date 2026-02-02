@@ -14,43 +14,41 @@ import os
 import logging
 from typing import Optional
 
-from iot_machine_learning.ml_service.reading_broker import ReadingBroker
-from iot_machine_learning.ml_service.in_memory_broker import InMemoryReadingBroker
-from iot_machine_learning.ml_service.broker import (
-    RedisReadingBroker,
-    BrokerType,
-)
+from ..core.domain.broker_interface import IReadingBroker, NullBroker
+
+# Import condicional de ML
+try:
+    from iot_machine_learning.ml_service.reading_broker import ReadingBroker
+    from iot_machine_learning.ml_service.in_memory_broker import InMemoryReadingBroker
+    from iot_machine_learning.ml_service.broker import RedisReadingBroker, BrokerType
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    ReadingBroker = None
+    InMemoryReadingBroker = None
+    RedisReadingBroker = None
+    BrokerType = None
 
 from .throttled import ThrottledReadingBroker
 
 logger = logging.getLogger(__name__)
 
-_broker_instance: Optional[ReadingBroker] = None
+_broker_instance: Optional[IReadingBroker] = None
 
 
 def create_broker(
     min_interval_seconds: Optional[float] = None,
     use_redis: Optional[bool] = None,
     redis_url: Optional[str] = None,
-) -> ReadingBroker:
+) -> IReadingBroker:
     """Crea una nueva instancia del broker.
     
-    Args:
-        min_interval_seconds: Intervalo mínimo entre publicaciones por sensor.
-                              Default: ML_PUBLISH_MIN_INTERVAL_SECONDS env var o 1.0
-        use_redis: Si True, usa Redis Streams. Si False, usa InMemory.
-                   Default: USE_REDIS_BROKER env var o True
-        redis_url: URL de conexión a Redis.
-                   Default: REDIS_URL env var o redis://localhost:6379/0
-    
-    Returns:
-        ReadingBroker configurado con throttling
-        
-    Environment Variables:
-        ML_PUBLISH_MIN_INTERVAL_SECONDS: Intervalo mínimo entre publicaciones
-        USE_REDIS_BROKER: "true" o "false" para habilitar/deshabilitar Redis
-        REDIS_URL: URL de conexión a Redis
+    Returns NullBroker if ML module is not available.
     """
+    if not ML_AVAILABLE:
+        logger.warning("[BROKER_FACTORY] ML not available, using NullBroker")
+        return NullBroker()
+    
     if min_interval_seconds is None:
         min_interval_seconds = float(
             os.getenv("ML_PUBLISH_MIN_INTERVAL_SECONDS", "1.0")
@@ -60,7 +58,7 @@ def create_broker(
         use_redis = os.getenv("USE_REDIS_BROKER", "true").lower() == "true"
     
     # Seleccionar broker base
-    base_broker: ReadingBroker
+    base_broker: IReadingBroker
     
     if use_redis:
         try:
@@ -93,7 +91,7 @@ def create_broker(
     )
 
 
-def get_broker() -> ReadingBroker:
+def get_broker() -> IReadingBroker:
     """Obtiene la instancia singleton del broker.
     
     Crea el broker en la primera llamada y lo reutiliza después.

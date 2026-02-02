@@ -80,7 +80,7 @@ class MQTTReadingPayload(BaseModel):
         except Exception as e:
             raise ValueError(f"Invalid timestamp format: {e}")
     
-    @root_validator(pre=False)
+    @root_validator(pre=False, skip_on_failure=True)
     def cache_parsed_timestamp(cls, values):
         """Parsea timestamp una sola vez y cachea el resultado."""
         ts_str = values.get("timestamp")

@@ -14,7 +14,15 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
-from iot_machine_learning.ml_service.utils.numeric_precision import safe_float
+# Import condicional para evitar dependencia cuando ML no está instalado
+try:
+    from iot_machine_learning.ml_service.utils.numeric_precision import safe_float
+except ImportError:
+    def safe_float(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
 from .models import CanonicalThresholds, PhysicalRange, DeltaThreshold, LastReading
 

@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from typing import Dict
 
-from iot_machine_learning.ml_service.reading_broker import Reading, ReadingBroker
+from ..core.domain.broker_interface import IReadingBroker, Reading
 
 
-class ThrottledReadingBroker(ReadingBroker):
+class ThrottledReadingBroker(IReadingBroker):
     """Broker con throttling por sensor.
     
     Limita la frecuencia de publicación para evitar saturar
@@ -20,7 +20,7 @@ class ThrottledReadingBroker(ReadingBroker):
     
     def __init__(
         self, 
-        inner: ReadingBroker, 
+        inner: IReadingBroker, 
         *, 
         min_interval_seconds: float = 1.0
     ) -> None:
@@ -40,6 +40,6 @@ class ThrottledReadingBroker(ReadingBroker):
         self._last_published_ts_by_sensor[reading.sensor_id] = float(reading.timestamp)
         self._inner.publish(reading)
     
-    def subscribe(self, handler) -> None:
-        """Delega al broker interno."""
-        self._inner.subscribe(handler)
+    def is_connected(self) -> bool:
+        """Check if broker is connected."""
+        return self._inner.is_connected()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from ..ingest.resilience import get_resilience_health
+from ..pipelines.resilience import get_resilience_health
 
 router = APIRouter(tags=["health"])
 

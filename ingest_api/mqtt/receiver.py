@@ -1,9 +1,6 @@
 """Receptor MQTT principal.
 
-Usa paho-mqtt para recibir lecturas y las procesa con el SP de dominio.
-
-FIX 2026-02-02: Integración con resiliencia (deduplicación, DLQ).
-FIX 2026-02-02: Uso de orjson para parsing JSON más rápido.
+Refactored 2026-02-02: Split into modular files.
 """
 
 from __future__ import annotations
@@ -13,7 +10,6 @@ import os
 import time
 from typing import Optional
 
-# Usar orjson si está disponible (3-10x más rápido que json estándar)
 try:
     import orjson
     ORJSON_AVAILABLE = True
@@ -28,9 +24,10 @@ except ImportError:
     PAHO_AVAILABLE = False
 
 from .validators import validate_mqtt_reading
-from .connections import DatabaseConnection, RedisConnection
+from .receiver_connections import DatabaseConnection, RedisConnection
+from .receiver_stats import ReceiverStats
 from .processor import ReadingProcessor
-from ..ingest.resilience import get_deduplicator, get_dlq, MessageDeduplicator, DeadLetterQueue
+from ..pipelines.resilience import get_deduplicator, get_dlq
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +53,9 @@ class MQTTReceiver:
         self._running = False
         self._connected = False
         
-        # Conexiones
         self._db = DatabaseConnection()
         self._redis = RedisConnection()
         self._processor: Optional[ReadingProcessor] = None
-        
-        # Stats
         self._stats = ReceiverStats()
     
     def start(self) -> bool:
@@ -152,81 +146,8 @@ class MQTTReceiver:
     
     def _on_message(self, client, userdata, msg):
         """Callback de mensaje recibido."""
-        self._stats.received += 1
-        self._stats.last_message_at = time.time()
-        
-        try:
-            data = self._parse_json(msg.payload, msg.topic)
-            if data is None:
-                # Enviar a DLQ
-                dlq = get_dlq()
-                if dlq:
-                    dlq.send(
-                        payload=msg.payload,
-                        error="Invalid JSON",
-                        error_type="parse_error",
-                        source="mqtt",
-                    )
-                return
-            
-            validation = validate_mqtt_reading(data)
-            if not validation.valid:
-                logger.warning("[MQTT] Validation failed: %s", validation.error)
-                self._stats.failed += 1
-                # Enviar a DLQ
-                dlq = get_dlq()
-                if dlq:
-                    dlq.send(
-                        payload=data,
-                        error=validation.error,
-                        error_type="validation_error",
-                        source="mqtt",
-                    )
-                return
-            
-            # Deduplicación
-            dedup = get_deduplicator()
-            if dedup:
-                msg_id = validation.payload.msg_id or dedup.generate_msg_id(
-                    sensor_id=validation.payload.sensor_id_int or 0,
-                    timestamp=validation.payload.timestamp_float,
-                    value=validation.payload.value,
-                )
-                if dedup.is_duplicate(msg_id):
-                    self._stats.duplicates += 1
-                    logger.debug("[MQTT] Duplicate msg_id=%s", msg_id)
-                    return
-            
-            self._processor.process(validation.payload)
-            self._stats.processed += 1
-            
-            if self._stats.processed % 100 == 0:
-                logger.info("[MQTT] %s", self._stats)
-            
-        except Exception as e:
-            logger.exception("[MQTT] Processing error: %s", e)
-            self._stats.failed += 1
-            # Enviar a DLQ
-            dlq = get_dlq()
-            if dlq:
-                dlq.send(
-                    payload=str(msg.payload)[:1000],
-                    error=str(e),
-                    error_type="processing_error",
-                    source="mqtt",
-                )
-    
-    def _parse_json(self, payload: bytes, topic: str) -> Optional[dict]:
-        """Parsea payload JSON usando orjson si está disponible."""
-        try:
-            if ORJSON_AVAILABLE:
-                return orjson.loads(payload)
-            else:
-                return json.loads(payload.decode("utf-8"))
-        except Exception as e:
-            logger.warning("[MQTT] Invalid JSON: %s (topic=%s)", e, topic)
-            self._stats.failed += 1
-            return None
+        from .message_handler import handle_message
+        handle_message(msg, self._stats, self._processor)
     
     @property
     def is_running(self) -> bool:
@@ -265,55 +186,5 @@ class MQTTReceiver:
         }
 
 
-class ReceiverStats:
-    """Estadísticas del receptor."""
-    
-    def __init__(self):
-        self.received = 0
-        self.processed = 0
-        self.failed = 0
-        self.duplicates = 0
-        self.last_message_at: float = 0
-    
-    def __str__(self) -> str:
-        return f"Stats: received={self.received} processed={self.processed} failed={self.failed} duplicates={self.duplicates}"
-
-
-# Singleton
-_receiver: Optional[MQTTReceiver] = None
-
-
-def get_receiver() -> Optional[MQTTReceiver]:
-    """Obtiene el receptor singleton."""
-    return _receiver
-
-
-def start_receiver() -> bool:
-    """Inicia el receptor."""
-    global _receiver
-    
-    if _receiver is not None:
-        return _receiver.is_running
-    
-    broker_host = os.getenv("MQTT_BROKER_HOST", "localhost")
-    broker_port = int(os.getenv("MQTT_BROKER_PORT", "1883"))
-    username = os.getenv("MQTT_USERNAME") or None
-    password = os.getenv("MQTT_PASSWORD") or None
-    
-    _receiver = MQTTReceiver(
-        broker_host=broker_host,
-        broker_port=broker_port,
-        username=username,
-        password=password,
-    )
-    
-    return _receiver.start()
-
-
-def stop_receiver():
-    """Detiene el receptor."""
-    global _receiver
-    
-    if _receiver is not None:
-        _receiver.stop()
-        _receiver = None
+# Re-export singleton functions from receiver_singleton
+from .receiver_singleton import get_receiver, start_receiver, stop_receiver
