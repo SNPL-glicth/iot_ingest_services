@@ -78,3 +78,22 @@ class RedisConnection:
     @property
     def stream_name(self) -> str:
         return self._stream_name
+    
+    def publish(self, data: dict) -> bool:
+        """Publish data to Redis Stream for ML processing.
+        
+        Args:
+            data: Dictionary with sensor reading data
+            
+        Returns:
+            True if published successfully, False otherwise
+        """
+        if not self._connected or not self._client:
+            return False
+        
+        try:
+            self._client.xadd(self._stream_name, data, maxlen=10000)
+            return True
+        except Exception as e:
+            logger.warning("[Redis] Publish failed: %s", e)
+            return False
