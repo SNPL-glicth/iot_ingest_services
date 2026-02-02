@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..common.physical_ranges import PhysicalRange
-from ...classification.sensor_state import SensorStateManager, SensorOperationalState
+from ...classification import SensorStateManager, SensorOperationalState
 
 logger = logging.getLogger(__name__)
 
