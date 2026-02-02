@@ -191,20 +191,21 @@ class BatchInserter:
 
         with self._engine.begin() as conn:
             # Preparar datos para bulk insert
+            # Esquema: sensor_readings(sensor_id, value, timestamp, device_timestamp)
             values = []
             for r in readings:
                 values.append({
                     "sensor_id": r.sensor_id,
                     "value": r.value,
-                    "timestamp": r.device_timestamp or r.ingest_timestamp,
-                    "created_at": r.ingest_timestamp,
+                    "timestamp": r.ingest_timestamp,
+                    "device_timestamp": r.device_timestamp,
                 })
 
             # Bulk INSERT usando executemany
             conn.execute(
                 text("""
-                    INSERT INTO dbo.sensor_readings (sensor_id, value, timestamp, created_at)
-                    VALUES (:sensor_id, :value, :timestamp, :created_at)
+                    INSERT INTO dbo.sensor_readings (sensor_id, value, timestamp, device_timestamp)
+                    VALUES (:sensor_id, :value, :timestamp, :device_timestamp)
                 """),
                 values,
             )

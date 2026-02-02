@@ -52,10 +52,6 @@ from .endpoints import (
     diagnostics_router,
 )
 
-_mqtt_receiver = None
-_mqtt_bridge = None
-
-
 app = FastAPI(title="IoT Ingest Service", version="0.5.0")
 
 app.include_router(health_router)
@@ -87,25 +83,25 @@ async def startup_event():
     # MQTT Ingest: Canal principal cuando está habilitado
     if os.getenv("FF_MQTT_INGEST_ENABLED", "false").lower() == "true":
         try:
-            from .mqtt import MQTTIngestReceiver, MQTTRedisBridge
+            # Usar receptor simple (paho-mqtt directo → BD)
+            from .mqtt.simple_receiver import start_simple_receiver, get_simple_receiver
             
-            _mqtt_bridge = MQTTRedisBridge(
-                dedup_enabled=True,
-                dedup_ttl_seconds=int(os.getenv("MQTT_DEDUP_TTL_SECONDS", "60")),
-            )
-            _mqtt_receiver = MQTTIngestReceiver(_mqtt_bridge)
-            
-            started = await _mqtt_receiver.start()
+            started = start_simple_receiver()
             if started:
+                receiver = get_simple_receiver()
                 logger.info(
-                    "[MQTT] Receptor MQTT iniciado - escuchando iot/sensors/+/readings"
+                    "[MQTT] Receptor SIMPLE iniciado - escuchando iot/sensors/+/readings → BD directa"
+                )
+                logger.info(
+                    "[MQTT] Broker: %s",
+                    receiver.stats.get("broker") if receiver else "N/A"
                 )
             else:
                 logger.warning(
-                    "[MQTT] Receptor MQTT no pudo iniciarse - verificar EMQX y configuración"
+                    "[MQTT] Receptor SIMPLE no pudo iniciarse - verificar EMQX y BatchInserter"
                 )
         except ImportError as e:
-            logger.warning("[MQTT] Módulo iot_mqtt no disponible: %s", e)
+            logger.warning("[MQTT] Error importando simple_receiver: %s", e)
         except Exception as e:
             logger.exception("[MQTT] Error iniciando receptor MQTT: %s", e)
     else:
@@ -115,32 +111,22 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Detiene el BatchInserter, receptor MQTT y hace flush de datos pendientes."""
-    global _mqtt_receiver, _mqtt_bridge
     logger = logging.getLogger(__name__)
     
-    if _mqtt_receiver is not None:
-        try:
-            stats = _mqtt_receiver.stats
-            await _mqtt_receiver.stop()
+    # Detener receptor MQTT simple
+    try:
+        from .mqtt.simple_receiver import stop_simple_receiver, get_simple_receiver
+        receiver = get_simple_receiver()
+        if receiver is not None:
+            stats = receiver.stats
+            stop_simple_receiver()
             logger.info(
-                "[MQTT] Receptor MQTT detenido - processed=%d failed=%d",
+                "[MQTT] Receptor SIMPLE detenido - processed=%d failed=%d",
                 stats.get("messages_processed", 0),
                 stats.get("messages_failed", 0),
             )
-        except Exception as e:
-            logger.error("[MQTT] Error deteniendo receptor MQTT: %s", e)
-    
-    if _mqtt_bridge is not None:
-        try:
-            stats = _mqtt_bridge.stats
-            logger.info(
-                "[MQTT] Bridge stats - processed=%d deduplicated=%d failed=%d",
-                stats.get("readings_processed", 0),
-                stats.get("readings_deduplicated", 0),
-                stats.get("readings_failed", 0),
-            )
-        except Exception as e:
-            logger.error("[MQTT] Error obteniendo stats del bridge: %s", e)
+    except Exception as e:
+        logger.error("[MQTT] Error deteniendo receptor MQTT: %s", e)
     
     try:
         shutdown_batch_inserter()
@@ -152,30 +138,39 @@ async def shutdown_event():
 @app.get("/mqtt/health")
 async def mqtt_health():
     """Health check del receptor MQTT."""
-    if _mqtt_receiver is None:
+    try:
+        from .mqtt.simple_receiver import get_simple_receiver
+        receiver = get_simple_receiver()
+        
+        if receiver is None:
+            return {
+                "enabled": False,
+                "reason": "FF_MQTT_INGEST_ENABLED=false or receiver not started",
+            }
+        
         return {
-            "enabled": False,
-            "reason": "FF_MQTT_INGEST_ENABLED=false or module not available",
+            "enabled": True,
+            "type": "simple_receiver",
+            "health": receiver.health_check(),
         }
-    
-    receiver_health = _mqtt_receiver.health_check()
-    bridge_health = _mqtt_bridge.health_check() if _mqtt_bridge else {}
-    
-    return {
-        "enabled": True,
-        "receiver": receiver_health,
-        "bridge": bridge_health,
-    }
+    except Exception as e:
+        return {"enabled": False, "error": str(e)}
 
 
 @app.get("/mqtt/stats")
 async def mqtt_stats():
     """Estadísticas del receptor MQTT."""
-    if _mqtt_receiver is None:
-        return {"enabled": False}
-    
-    return {
-        "enabled": True,
-        "receiver": _mqtt_receiver.stats,
-        "bridge": _mqtt_bridge.stats if _mqtt_bridge else {},
-    }
+    try:
+        from .mqtt.simple_receiver import get_simple_receiver
+        receiver = get_simple_receiver()
+        
+        if receiver is None:
+            return {"enabled": False}
+        
+        return {
+            "enabled": True,
+            "type": "simple_receiver",
+            "stats": receiver.stats,
+        }
+    except Exception as e:
+        return {"enabled": False, "error": str(e)}
