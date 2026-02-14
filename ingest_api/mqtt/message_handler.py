@@ -35,8 +35,13 @@ def parse_json(payload: bytes, topic: str, stats: ReceiverStats) -> Optional[dic
         return None
 
 
-def handle_message(msg, stats: ReceiverStats, processor) -> None:
-    """Procesa un mensaje MQTT recibido."""
+def handle_message(msg, stats: ReceiverStats, processor, async_processor=None) -> None:
+    """Procesa un mensaje MQTT recibido.
+
+    If async_processor is provided, validated payloads are enqueued
+    for async processing (frees paho thread). Otherwise falls back
+    to synchronous processor.process().
+    """
     stats.received += 1
     
     import time
@@ -68,8 +73,15 @@ def handle_message(msg, stats: ReceiverStats, processor) -> None:
                 logger.debug("[MQTT] Duplicate msg_id=%s", msg_id)
                 return
         
-        processor.process(validation.payload)
-        stats.processed += 1
+        # Async path: enqueue and return immediately (frees paho thread)
+        if async_processor is not None:
+            if async_processor.enqueue(validation.payload):
+                stats.processed += 1
+            else:
+                stats.failed += 1
+        else:
+            processor.process(validation.payload)
+            stats.processed += 1
         
         if stats.processed % 100 == 0:
             logger.info("[MQTT] %s", stats)

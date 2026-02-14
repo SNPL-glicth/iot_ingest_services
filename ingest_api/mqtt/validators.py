@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,8 @@ class MQTTReadingPayload(BaseModel):
     }
     """
     
+    model_config = ConfigDict(populate_by_name=True)
+
     v: int = Field(default=1, ge=1, le=10)
     sensor_id: str = Field(..., alias="sensorId")
     value: float
@@ -45,9 +47,13 @@ class MQTTReadingPayload(BaseModel):
     type: str = "reading"
     metadata: dict[str, Any] = Field(default_factory=dict)
     msg_id: Optional[str] = Field(default=None, alias="msgId")
-    
-    @validator("value")
-    def validate_value(cls, v):
+
+    _parsed_ts: Optional[float] = PrivateAttr(default=None)
+    _parsed_dt: Optional[datetime] = PrivateAttr(default=None)
+
+    @field_validator("value")
+    @classmethod
+    def validate_value(cls, v: float) -> float:
         if v != v:  # NaN check
             raise ValueError("Value is NaN")
         if v == float("inf") or v == float("-inf"):
@@ -55,49 +61,42 @@ class MQTTReadingPayload(BaseModel):
         if not (-1e12 < v < 1e12):
             raise ValueError("Value out of range")
         return v
-    
-    # Campos cacheados (se calculan una vez en root_validator)
-    _parsed_ts: Optional[float] = None
-    _parsed_dt: Optional[datetime] = None
-    
-    class Config:
-        populate_by_name = True
-    
-    @validator("timestamp")
-    def validate_timestamp(cls, v):
+
+    @field_validator("timestamp")
+    @classmethod
+    def validate_timestamp(cls, v: str) -> str:
         try:
             dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
             ts = dt.timestamp()
             now = time.time()
-            
+
             if ts > now + 300:
                 raise ValueError("Timestamp too far in future (>5 min)")
             if ts < now - 86400:
                 raise ValueError("Timestamp too old (>24 hours)")
-            
+
             return v
         except Exception as e:
             raise ValueError(f"Invalid timestamp format: {e}")
-    
-    @root_validator(pre=False, skip_on_failure=True)
-    def cache_parsed_timestamp(cls, values):
-        """Parsea timestamp una sola vez y cachea el resultado."""
-        ts_str = values.get("timestamp")
-        if ts_str:
-            try:
-                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                values["_parsed_dt"] = dt
-                values["_parsed_ts"] = dt.timestamp()
-            except Exception:
-                values["_parsed_ts"] = time.time()
-                values["_parsed_dt"] = datetime.now(timezone.utc)
-        return values
-    
-    @validator("sensor_id")
-    def validate_sensor_id(cls, v):
+
+    @field_validator("sensor_id")
+    @classmethod
+    def validate_sensor_id(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("sensorId is required")
         return v.strip()
+
+    @model_validator(mode="after")
+    def cache_parsed_timestamp(self) -> "MQTTReadingPayload":
+        """Parsea timestamp una sola vez y cachea el resultado."""
+        try:
+            dt = datetime.fromisoformat(self.timestamp.replace("Z", "+00:00"))
+            self._parsed_dt = dt
+            self._parsed_ts = dt.timestamp()
+        except Exception:
+            self._parsed_ts = time.time()
+            self._parsed_dt = datetime.now(timezone.utc)
+        return self
     
     @property
     def sensor_id_int(self) -> Optional[int]:

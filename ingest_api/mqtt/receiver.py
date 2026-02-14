@@ -6,16 +6,8 @@ Refactored 2026-02-02: Split into modular files.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Optional
-
-try:
-    import orjson
-    ORJSON_AVAILABLE = True
-except ImportError:
-    import json
-    ORJSON_AVAILABLE = False
 
 try:
     import paho.mqtt.client as mqtt
@@ -23,11 +15,9 @@ try:
 except ImportError:
     PAHO_AVAILABLE = False
 
-from .validators import validate_mqtt_reading
 from .receiver_connections import DatabaseConnection, RedisConnection
 from .receiver_stats import ReceiverStats
 from .processor import ReadingProcessor
-from ..pipelines.resilience import get_deduplicator, get_dlq
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +46,7 @@ class MQTTReceiver:
         self._db = DatabaseConnection()
         self._redis = RedisConnection()
         self._processor: Optional[ReadingProcessor] = None
+        self._async_processor = None
         self._stats = ReceiverStats()
     
     def start(self) -> bool:
@@ -73,8 +64,16 @@ class MQTTReceiver:
             # Conectar a Redis (opcional)
             self._redis.connect()
             
-            # Crear procesador
-            self._processor = ReadingProcessor(self._db.engine, self._redis)
+            # Crear procesador (with optional circuit breaker + DLQ)
+            cb, dlq = self._create_resilience()
+            self._processor = ReadingProcessor(
+                self._db.engine, self._redis,
+                circuit_breaker=cb, dlq=dlq,
+            )
+            
+            # Crear async processor (feature-flag controlled)
+            from .async_processor import create_async_processor
+            self._async_processor = create_async_processor(self._processor)
             
             # Crear cliente MQTT
             self._client = mqtt.Client(
@@ -117,6 +116,9 @@ class MQTTReceiver:
         """Detiene el receptor."""
         self._running = False
         
+        if self._async_processor is not None:
+            self._async_processor.stop(drain=True)
+        
         if self._client:
             try:
                 self._client.loop_stop()
@@ -147,7 +149,7 @@ class MQTTReceiver:
     def _on_message(self, client, userdata, msg):
         """Callback de mensaje recibido."""
         from .message_handler import handle_message
-        handle_message(msg, self._stats, self._processor)
+        handle_message(msg, self._stats, self._processor, self._async_processor)
     
     @property
     def is_running(self) -> bool:
@@ -157,34 +159,53 @@ class MQTTReceiver:
     def is_connected(self) -> bool:
         return self._connected
     
+    def _create_resilience(self):
+        """Create circuit breaker + DLQ if feature flag enabled."""
+        import os
+        enabled = os.getenv("ML_INGEST_CIRCUIT_BREAKER_ENABLED", "true").lower() in (
+            "true", "1", "yes", "on",
+        )
+        if not enabled:
+            return None, None
+        try:
+            from ..pipelines.resilience.circuit_breaker import CircuitBreaker
+            from ..pipelines.resilience.circuit_breaker_config import CircuitBreakerConfig
+            from ..pipelines.resilience.dead_letter import DeadLetterQueue
+            threshold = int(os.getenv("ML_INGEST_CB_FAILURE_THRESHOLD", "5"))
+            timeout = float(os.getenv("ML_INGEST_CB_TIMEOUT_SECONDS", "30"))
+            cfg = CircuitBreakerConfig(
+                failure_threshold=threshold, recovery_timeout_seconds=timeout,
+            )
+            cb = CircuitBreaker("sql_sp", config=cfg)
+            redis_client = self._redis.client if self._redis.is_connected else None
+            dlq = DeadLetterQueue(redis_client=redis_client)
+            logger.info("[MQTT] Circuit breaker enabled (threshold=%d, timeout=%.0fs)",
+                        threshold, timeout)
+            return cb, dlq
+        except Exception as exc:
+            logger.warning("[MQTT] Circuit breaker init failed: %s", exc)
+            return None, None
+
     @property
     def stats(self) -> dict:
+        s = self._stats
         return {
-            "running": self._running,
-            "connected": self._connected,
+            "running": self._running, "connected": self._connected,
             "broker": f"{self.broker_host}:{self.broker_port}",
-            "messages_received": self._stats.received,
-            "messages_processed": self._stats.processed,
-            "messages_failed": self._stats.failed,
-            "last_message_at": self._stats.last_message_at,
-            "db_connected": self._db.is_connected,
-            "redis_connected": self._redis.is_connected,
-            "redis_stream": self._redis.stream_name,
-            "uses_sp": True,
+            "received": s.received, "processed": s.processed,
+            "failed": s.failed, "last_message_at": s.last_message_at,
+            "db": self._db.is_connected, "redis": self._redis.is_connected,
+            "async": self._async_processor is not None,
         }
-    
+
     def health_check(self) -> dict:
         return {
             "healthy": self._running and self._connected and self._db.is_connected,
-            "running": self._running,
-            "connected": self._connected,
-            "db_connected": self._db.is_connected,
-            "redis_connected": self._redis.is_connected,
-            "messages_processed": self._stats.processed,
-            "messages_failed": self._stats.failed,
-            "uses_sp": "sp_insert_reading_and_check_threshold",
+            "running": self._running, "connected": self._connected,
+            "db": self._db.is_connected, "redis": self._redis.is_connected,
+            "processed": self._stats.processed, "failed": self._stats.failed,
+            "async": self._async_processor is not None,
         }
-
 
 # Re-export singleton functions from receiver_singleton
 from .receiver_singleton import get_receiver, start_receiver, stop_receiver

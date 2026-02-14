@@ -21,7 +21,14 @@ def build_sqlalchemy_url(settings: Settings) -> str:
     )
 
 
+_engine: Engine | None = None
+
+
 def get_engine() -> Engine:
+    global _engine
+    if _engine is not None:
+        return _engine
+
     settings = get_settings()
     url = build_sqlalchemy_url(settings)
 
@@ -33,16 +40,16 @@ def get_engine() -> Engine:
         settings.db_user,
     )
 
-    engine = create_engine(url, pool_pre_ping=True, future=True)
+    _engine = create_engine(url, pool_pre_ping=True, pool_recycle=300, future=True)
 
     try:
-        with engine.connect() as conn:
+        with _engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         logger.info("[DB] Test de conexión OK")
     except Exception:
         logger.exception("[DB] Test de conexión FALLÓ")
 
-    return engine
+    return _engine
 
 
 SessionLocal = sessionmaker(
