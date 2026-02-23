@@ -1,173 +1,196 @@
-# Arquitectura de Ingesta por Propósito
+# ingest_api/pipelines
+
+Pipeline de procesamiento de lecturas clasificadas por propósito.
 
 ## Estructura
 
 ```
-ingest/
-├── common/                    # Utilidades compartidas
-│   ├── validation.py         # Validaciones defensivas por pipeline
-│   ├── physical_ranges.py    # Manejo de rangos físicos
-│   └── delta_utils.py         # Detección de delta spikes
+pipelines/
+├── router.py              # ReadingRouter — clasifica y enruta cada lectura
+├── router_sp.py           # execute_sp_with_retry, get_sensor_type_cached
+├── router_models.py       # PipelineType enum, SP_RETRY_CONFIG
+├── sensor_resolver.py     # resolve_sensor_id (device_uuid+sensor_uuid → int, cache)
 │
-├── alerts/                    # Pipeline de ALERTAS
-│   ├── alert_ingest.py        # Clase principal del pipeline
-│   ├── alert_rules.py         # Reglas de negocio
-│   └── alert_persistence.py   # Lógica de persistencia
+├── contracts/
+│   └── unified_reading.py # UnifiedReading — contrato único entre todos los pipelines
 │
-├── warnings/                  # Pipeline de WARNINGS
-│   ├── warning_ingest.py      # Clase principal del pipeline
-│   ├── warning_rules.py       # Reglas de negocio
-│   └── warning_persistence.py # Lógica de persistencia
+├── handlers/              # Handlers de alto nivel (usados por endpoints)
+│   ├── single.py          # SingleReadingHandler
+│   └── batch.py           # BatchReadingHandler
 │
-├── predictions/               # Pipeline de PREDICCIONES
-│   ├── prediction_ingest.py  # Clase principal del pipeline
-│   ├── prediction_rules.py    # Reglas de negocio
-│   └── prediction_dispatch.py  # Dispatch al broker ML
+├── alerts/                # Pipeline ALERT — violaciones de rango físico
+│   ├── alert_ingest.py    # AlertIngestPipeline (clase principal)
+│   ├── alert_rules.py     # AlertRules.accepts(), .get_severity()
+│   ├── alert_persistence.py  # Persiste en dbo.alerts + dbo.sensor_readings
+│   ├── alert_repository.py   # Queries SQL de alertas
+│   └── notification_service.py
 │
-└── router.py                  # Router central de clasificación
+├── warnings/              # Pipeline WARNING — delta spikes
+│   ├── warning_ingest.py  # WarningIngestPipeline
+│   ├── warning_rules.py   # WarningRules.accepts()
+│   └── warning_persistence.py  # Persiste en dbo.ml_events (DELTA_SPIKE)
+│
+├── predictions/           # Pipeline PREDICTION — datos limpios para ML
+│   ├── prediction_ingest.py   # PredictionIngestPipeline
+│   ├── prediction_rules.py    # PredictionRules.accepts()
+│   └── prediction_dispatch.py # Dispatch al broker ML (IReadingBroker)
+│
+├── shared/                # Utilidades compartidas entre pipelines
+│   ├── validation.py      # is_suspicious_zero_reading, log_suspicious_reading
+│   ├── guards.py          # guard_reading — validaciones defensivas
+│   ├── delta_utils.py     # compute_delta_spike (lógica pura, sin estado)
+│   ├── physical_ranges.py # PhysicalRanges por tipo de sensor
+│   ├── threshold_queries.py
+│   └── suspicious_readings.py
+│
+└── resilience/            # Componentes de resiliencia
+    ├── factory.py         # get_resilience_components() → (dedup, dlq)
+    ├── circuit_breaker.py # CircuitBreaker (CLOSED/OPEN/HALF_OPEN)
+    ├── circuit_breaker_config.py
+    ├── circuit_breaker_utils.py
+    ├── deduplication.py   # MessageDeduplicator (Redis SET NX, TTL 60s)
+    ├── dead_letter.py     # DeadLetterQueue (Redis List)
+    ├── dlq_consumer.py    # DLQConsumer — reintenta mensajes fallidos
+    ├── dlq_models.py
+    ├── dlq_operations.py
+    ├── dlq_startup.py
+    └── retry.py           # retry_with_backoff
 ```
 
-## Principios de Diseño
+---
 
-### 1. Separación por Propósito
-Cada pipeline es **independiente** y **aislado**:
-- Define qué datos acepta
-- Tiene sus propias reglas de validación
-- Implementa su propia lógica de persistencia/dispatch
-- Rechaza defensivamente datos que no le corresponden
-
-### 2. Validación Defensiva
-Cada pipeline **rechaza** datos que no cumplen sus criterios:
-- `AlertIngestPipeline`: Solo acepta violaciones de rango físico
-- `WarningIngestPipeline`: Solo acepta delta spikes detectados
-- `PredictionIngestPipeline`: Solo acepta datos limpios
-
-### 3. Router Central
-El `ReadingRouter` clasifica **UNA VEZ** y enruta a **exactamente UN pipeline**:
-- Orden de evaluación estricto: ALERT → WARNING → PREDICTION
-- Sin estado compartido entre sensores
-- Sin filtrado implícito, solo enrutamiento explícito
-
-## Pipelines
-
-### ALERT Pipeline
-**Propósito**: Valores fuera de rango físico
-
-**Reglas**:
-- ✅ Acepta solo violaciones de rango físico
-- ✅ Severity siempre = `critical` (nunca puede ser downgradeado)
-- ✅ Persiste: última lectura válida + lectura que rompe umbral
-- ❌ **NUNCA** envía datos al ML
-
-**Archivos**:
-- `alert_rules.py`: Define qué acepta y reglas de negocio
-- `alert_persistence.py`: Persistencia en `alerts` y `sensor_readings`
-- `alert_ingest.py`: Clase principal con validación defensiva
-
-### WARNING Pipeline
-**Propósito**: Delta spikes o cambios bruscos
-
-**Reglas**:
-- ✅ Acepta solo lecturas con delta spike detectado
-- ✅ Persiste: evento de delta spike en `ml_events`
-- ✅ Solo 1 advertencia activa por sensor
-- ❌ **NUNCA** envía datos al ML
-
-**Archivos**:
-- `warning_rules.py`: Define qué acepta y reglas de negocio
-- `warning_persistence.py`: Persistencia en `ml_events` con código `DELTA_SPIKE`
-- `warning_ingest.py`: Clase principal con validación defensiva
-
-### PREDICTION Pipeline
-**Propósito**: Datos limpios para ML
-
-**Reglas**:
-- ✅ Acepta solo datos limpios (sin violación física, sin delta spike)
-- ✅ Conserva decimales completos
-- ✅ NO persiste todas las lecturas masivamente
-- ✅ Actualiza `sensor_readings_latest`
-- ✅ **SIEMPRE** envía datos limpios al broker ML
-
-**Archivos**:
-- `prediction_rules.py`: Define qué acepta y reglas de negocio
-- `prediction_dispatch.py`: Dispatch al broker ML
-- `prediction_ingest.py`: Clase principal con validación defensiva
-
-## Flujo de Datos
+## Flujo de enrutamiento
 
 ```
-Lectura → ReadingRouter.classify_and_route()
-              ↓
-    ┌─────────┼─────────┐
-    ↓         ↓         ↓
-  ALERT   WARNING  PREDICTION
-    ↓         ↓         ↓
-  Rechaza  Rechaza   Rechaza
-  si no    si no     si no
-  viola    tiene     está
-  rango    spike     limpio
-    ↓         ↓         ↓
-  Persiste Persiste  Dispatch
-  alerta   warning   a ML
+ReadingRouter.route(sensor_id, value, timestamp)
+  │
+  ├── guard_reading()              ← rechaza NaN, infinitos, sensor_id inválido
+  ├── is_suspicious_zero_reading() ← loguea pero no rechaza
+  ├── MessageDeduplicator.is_duplicate()  ← Redis SET NX
+  │
+  └── execute_sp_with_retry()     ← SP sp_insert_reading_and_check_threshold
+        │
+        └── Resultado del SP determina pipeline:
+              ├── violación física  → AlertIngestPipeline
+              ├── delta spike       → WarningIngestPipeline
+              └── limpio            → PredictionIngestPipeline
 ```
 
-## Validación Defensiva
+---
 
-Cada pipeline implementa validación defensiva:
+## Los tres pipelines
+
+### ALERT — Violaciones de rango físico
+
+**Condición:** `value < physical_min OR value > physical_max`
 
 ```python
-# Ejemplo: AlertIngestPipeline
-def ingest(self, sensor_id, value, ...):
-    should_accept, physical_range, reason = AlertRules.accepts(...)
-    
-    if not should_accept:
-        raise ValueError(f"Alert pipeline rechazó datos: {reason}")
-    
-    # Solo procesa si pasa la validación
-    persist_alert(...)
+AlertRules.accepts(sensor_id, value, physical_range)
+  → (True, range, reason) si viola rango físico
+  → (False, ...) si no aplica
 ```
 
-## Reglas Estrictas
+**Persiste:**
+- `dbo.sensor_readings` — lectura que rompe el umbral
+- `dbo.alerts` — alerta activa (cierra la anterior si existe)
+- `dbo.alert_notifications` — notificación push
 
-1. **ALERT y WARNING NO envían datos al ML**
-   - Implementado con `assert not AlertRules.should_forward_to_ml()`
-   - Implementado con `assert not WarningRules.should_forward_to_ml()`
+**Reglas estrictas:**
+- Severity siempre `critical` — no se puede degradar
+- Solo 1 alerta activa por sensor
+- **NUNCA** envía al broker ML
 
-2. **PREDICTION solo recibe datos limpios**
-   - Validación defensiva rechaza violaciones físicas
-   - Validación defensiva rechaza delta spikes
+---
 
-3. **Solo 1 alerta/advertencia activa por sensor**
-   - Implementado en `alert_persistence.py` y `warning_persistence.py`
-   - Cierra alertas/advertencias previas antes de crear nuevas
+### WARNING — Delta spikes
 
-4. **No guardar todas las lecturas masivamente**
-   - ALERT: Solo guarda lectura que rompe umbral
-   - WARNING: Solo guarda evento de delta spike
-   - PREDICTION: Solo actualiza `sensor_readings_latest`, NO persiste lectura completa
-
-5. **No downgradear severity CRITICAL**
-   - `AlertRules.get_severity()` siempre retorna `"critical"`
-   - No hay código path que pueda cambiar esto
-
-## Compatibilidad
-
-- ✅ Endpoints públicos sin cambios
-- ✅ Respuestas idénticas (`IngestResult`, `PacketIngestResult`)
-- ✅ Sin breaking changes en la API
-- ✅ Mismo comportamiento desde el exterior
-
-## Uso
+**Condición:** cambio brusco de valor en tiempo corto (`|Δvalue/Δt| > threshold`)
 
 ```python
-from ingest.router import ReadingRouter
-
-router = ReadingRouter(db, broker)
-pipeline_type = router.classify_and_route(
-    sensor_id=1,
-    value=45.5,
-    device_timestamp=datetime.now(),
-)
-# Retorna: PipelineType.ALERT, WARNING, o PREDICTION
+WarningRules.accepts(sensor_id, value, prev_value, delta_t)
+  → (True, reason) si hay delta spike
 ```
 
+**Persiste:**
+- `dbo.ml_events` con `event_type=DELTA_SPIKE`
+
+**Reglas estrictas:**
+- Solo 1 advertencia activa por sensor
+- **NUNCA** envía al broker ML
+
+---
+
+### PREDICTION — Datos limpios para ML
+
+**Condición:** sin violación física, sin delta spike
+
+```python
+PredictionRules.accepts(classified_reading)
+  → True si ReadingClass.ML_PREDICTION
+```
+
+**Persiste:**
+- `dbo.sensor_readings_latest` — última lectura válida
+
+**Dispatch:**
+- `broker.publish(reading)` → ML online (`SimpleMlOnlineProcessor`)
+
+---
+
+## Resiliencia
+
+### Deduplicación
+
+```python
+dedup = MessageDeduplicator(redis_client, ttl_seconds=60)
+if dedup.is_duplicate(sensor_id, timestamp):
+    return  # descarta silenciosamente
+```
+
+Usa Redis `SET NX EX 60`. Si Redis no está disponible, se deshabilita automáticamente.
+
+### Dead Letter Queue
+
+Mensajes que fallan tras todos los reintentos van a la DLQ (Redis List).
+`DLQConsumer` los reintenta periódicamente con backoff.
+
+```bash
+# Ver estado DLQ
+GET /resilience/health
+```
+
+### Circuit Breaker
+
+Protege el SP de SQL Server. Tras `CB_FAILURE_THRESHOLD` fallos consecutivos
+pasa a estado OPEN (rechaza llamadas) y prueba recuperación en HALF_OPEN.
+
+---
+
+## sensor_resolver.py
+
+Convierte `(device_uuid, sensor_uuid)` → `sensor_id: int` con cache en memoria:
+
+```python
+sensor_id = resolve_sensor_id(db, device_uuid, sensor_uuid)
+# Cache TTL: SENSOR_CACHE_TTL segundos (default 300)
+# Valida que sensor_uuid pertenece al device_uuid
+```
+
+---
+
+## contracts/unified_reading.py
+
+`UnifiedReading` es el contrato único que fluye entre todos los pipelines:
+
+```python
+@dataclass
+class UnifiedReading:
+    sensor_id: int
+    value: float
+    device_timestamp: datetime
+    received_at: datetime
+    reading_class: ReadingClass      # ALERT | WARNING | ML_PREDICTION
+    physical_range: PhysicalRange
+    delta_info: Optional[DeltaInfo]
+    audit_id: str                    # UUID para trazabilidad
+```
