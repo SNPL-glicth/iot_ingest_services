@@ -134,9 +134,24 @@ class MQTTReceiver:
             self._connected = True
             logger.info("[MQTT] Connected to broker")
             
-            topic = "iot/sensors/+/readings"
-            client.subscribe(topic, qos=1)
-            logger.info("[MQTT] Subscribed to %s", topic)
+            # IoT topic - ALWAYS subscribed (legacy, must not change)
+            iot_topic = "iot/sensors/+/readings"
+            client.subscribe(iot_topic, qos=1)
+            logger.info("[MQTT] Subscribed to %s (IoT legacy)", iot_topic)
+            
+            # Multi-domain topics - only if feature flag enabled
+            import os
+            if os.getenv("FF_MQTT_MULTI_DOMAIN", "false").lower() in ("true", "1", "yes", "on"):
+                multi_domain_topics = [
+                    ("infrastructure/+/+/data", 1),
+                    ("finance/+/+/data", 1),
+                    ("health/+/+/data", 1),
+                ]
+                for topic, qos in multi_domain_topics:
+                    client.subscribe(topic, qos=qos)
+                    logger.info("[MQTT] Subscribed to %s (multi-domain)", topic)
+            else:
+                logger.info("[MQTT] Multi-domain topics disabled (FF_MQTT_MULTI_DOMAIN=false)")
         else:
             self._connected = False
             logger.error("[MQTT] Connection failed: rc=%d", rc)

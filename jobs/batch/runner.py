@@ -28,6 +28,7 @@ from .db_queries import (
     get_sensor_max_reading_id,
     load_recent_values,
     load_recent_values_with_timestamps,
+    load_first_actual_after_timestamp,
     get_device_id_for_sensor,
     get_or_create_active_model_id,
     update_watermark,
@@ -95,6 +96,19 @@ def _process_sensor(engine, cfg, flags, adapter, sensor_id):
             dedupe_minutes=cfg.dedupe_minutes,
         )
         update_watermark(conn, sensor_id=sensor_id, last_reading_id=max_id)
+
+        if adapter is not None and engine_tag == "enterprise":
+            try:
+                pred_ts = target_ts.timestamp()
+                actual = load_first_actual_after_timestamp(conn, sensor_id, pred_ts)
+                if actual is not None:
+                    adapter.record_actual(
+                        actual_value=actual,
+                        series_id=str(sensor_id),
+                    )
+            except Exception as _fb_err:
+                logger.debug("feedback_record_actual failed sensor=%d: %s", sensor_id, _fb_err)
+
         return engine_tag
 
 

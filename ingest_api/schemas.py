@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SensorReadingIn(BaseModel):
@@ -88,3 +88,48 @@ class SensorConsolidatedStatus(BaseModel):
     alert_active: Optional[ActiveAlert] = None
     warning_active: Optional[ActiveWarning] = None
     prediction_current: Optional[CurrentPrediction] = None
+
+
+# ============================================================================
+# Universal Ingestion Schemas (Multi-Domain)
+# These schemas support non-IoT domains (infrastructure, finance, health, etc.)
+# IoT domain continues to use DevicePacketIn above
+# ============================================================================
+
+
+class DataPointIn(BaseModel):
+    """Single data point for universal ingestion."""
+    stream_id: str
+    value: float
+    timestamp: Optional[datetime] = None
+    stream_type: Optional[str] = None
+    sequence: Optional[int] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class DataPacketIn(BaseModel):
+    """Batch of data points from a single source.
+    
+    Note: domain cannot be 'iot' - use POST /ingest/packets for IoT data.
+    """
+    source_id: str
+    domain: str = Field(..., pattern=r"^(?!iot$).*")
+    data_points: List[DataPointIn]
+    
+    @field_validator("domain")
+    @classmethod
+    def domain_not_iot(cls, v: str) -> str:
+        """Ensure domain is not 'iot'."""
+        if v.lower() == "iot":
+            raise ValueError(
+                "domain='iot' is not allowed in universal ingestion. "
+                "Use POST /ingest/packets for IoT data."
+            )
+        return v
+
+
+class DataIngestResult(BaseModel):
+    """Result of universal data ingestion."""
+    inserted: int
+    rejected: int = 0
+    results: List[Dict[str, Any]] = Field(default_factory=list)

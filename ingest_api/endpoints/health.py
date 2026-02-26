@@ -1,6 +1,8 @@
 """Health and readiness endpoints."""
 
+import time
 from fastapi import APIRouter, HTTPException
+from sqlalchemy import text
 
 router = APIRouter(tags=["health"])
 
@@ -22,6 +24,49 @@ def ready():
         return {"status": "ready"}
     except Exception:
         raise HTTPException(status_code=503, detail="not ready")
+
+
+@router.get("/health/postgres")
+def postgres_health():
+    """Health check para PostgreSQL (universal ingestion).
+    
+    Verifica conectividad con SELECT 1 y mide latencia.
+    ISO 27001: No expone detalles de error al cliente.
+    
+    Returns:
+        {"status": "ok|error|disabled", "latency_ms": float}
+    """
+    try:
+        from ..infrastructure.persistence.postgres import get_postgres_engine
+        
+        engine = get_postgres_engine()
+        if engine is None:
+            return {
+                "status": "disabled",
+                "message": "PostgreSQL not configured (POSTGRES_URL not set)"
+            }
+        
+        # Medir latencia
+        start_time = time.time()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        latency_ms = (time.time() - start_time) * 1000
+        
+        return {
+            "status": "ok",
+            "latency_ms": round(latency_ms, 2)
+        }
+        
+    except Exception as e:
+        # ISO 27001: No exponer detalles del error al cliente
+        # Solo loguear internamente
+        import logging
+        logging.getLogger(__name__).exception("PostgreSQL health check failed")
+        
+        return {
+            "status": "error",
+            "message": "PostgreSQL connection failed"
+        }
 
 
 @router.get("/metrics")

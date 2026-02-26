@@ -53,6 +53,9 @@ from .endpoints import (
     packet_ingest_router,
     diagnostics_router,
 )
+from .endpoints.universal_ingest import router as universal_router
+from .transports.csv.endpoints import router as csv_router
+from .transports.websocket import websocket_ingest
 
 app = FastAPI(title="IoT Ingest Service", version="0.5.0")
 
@@ -62,6 +65,19 @@ app.include_router(single_ingest_router)
 app.include_router(batch_ingest_router)
 app.include_router(packet_ingest_router)
 app.include_router(diagnostics_router)
+app.include_router(
+    universal_router,
+    tags=["universal"],
+    dependencies=[],  # API key check is in the endpoint
+)
+app.include_router(
+    csv_router,
+    tags=["csv"],
+    dependencies=[],
+)
+
+# WebSocket endpoint
+app.add_api_websocket_route("/ingest/stream", websocket_ingest)
 
 
 @app.on_event("startup")
@@ -114,6 +130,18 @@ async def startup_event():
             logger.exception("[MQTT] Error iniciando receptor MQTT: %s", e)
     else:
         logger.info("[MQTT] Ingesta MQTT deshabilitada (FF_MQTT_INGEST_ENABLED=false)")
+    
+    # MQTT Universal: Para dominios no-IoT (feature-flagged)
+    if os.getenv("FF_MQTT_UNIVERSAL", "false").lower() == "true":
+        try:
+            from .transports.mqtt.receiver import start_universal_mqtt
+            started = start_universal_mqtt()
+            if started:
+                logger.info("[MQTT Universal] Receptor iniciado para dominios no-IoT")
+            else:
+                logger.info("[MQTT Universal] No iniciado (feature flag disabled o error)")
+        except Exception as e:
+            logger.exception("[MQTT Universal] Error iniciando receptor: %s", e)
 
 
 @app.on_event("shutdown")
@@ -143,6 +171,14 @@ async def shutdown_event():
             logger.info("[MQTT] Receptor SIMPLE detenido - processed=%d", stats.get("messages_processed", 0))
     except Exception as e:
         logger.error("[MQTT] Error deteniendo receptor: %s", e)
+    
+    # Detener MQTT Universal
+    try:
+        from .transports.mqtt.receiver import stop_universal_mqtt
+        stop_universal_mqtt()
+        logger.info("[MQTT Universal] Receptor detenido")
+    except Exception:
+        pass
     
     try:
         shutdown_batch_inserter()

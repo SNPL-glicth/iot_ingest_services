@@ -1,8 +1,10 @@
 # iot_ingest_services
 
-Microservicio Python de **ingesta de lecturas IoT** y jobs batch auxiliares.
+Microservicio Python de **ingesta universal multi-dominio** y jobs batch auxiliares.
 
-Recibe lecturas de sensores (HTTP o MQTT), las clasifica, persiste en SQL Server y publica al broker ML. Los jobs batch ejecutan predicciones baseline y enriquecen anomalías con explicaciones.
+**Arquitectura Agnóstica:** Soporta múltiples dominios (IoT, infrastructure, finance, health) con un núcleo universal. IoT funciona como un adapter más, manteniendo 100% compatibilidad con el sistema legacy.
+
+Recibe datos vía HTTP, MQTT, WebSocket o CSV, los clasifica según configuración por stream, persiste en SQL Server (IoT) o PostgreSQL (otros dominios) y publica al broker ML. Los jobs batch ejecutan predicciones baseline y enriquecen anomalías con explicaciones.
 
 ---
 
@@ -15,25 +17,27 @@ iot_ingest_services/
 │   └── db.py                      # get_engine() singleton SQLAlchemy
 │
 ├── ingest_api/                    # FastAPI — punto de entrada HTTP
-│   ├── main.py                    # Wiring: routers + startup/shutdown
-│   ├── schemas.py                 # Pydantic models de entrada/salida
+│   ├── main.py                    # Wiring: routers + startup/shutdown (IoT + Universal)
+│   ├── schemas.py                 # Pydantic models (IoT legacy + Universal)
 │   ├── batch_inserter.py          # BatchInserter async (buffer + flush)
 │   ├── rate_limiter.py            # Rate limiting por IP y dispositivo
 │   ├── device_auth.py             # Validación de device_uuid + sensor_uuid
 │   ├── debug.py                   # Helpers de debug (solo dev)
 │   │
 │   ├── endpoints/                 # Rutas HTTP
-│   │   ├── health.py              # GET /health
-│   │   ├── packet_ingest.py       # POST /ingest/packets  ← recomendado
-│   │   ├── single_ingest.py       # POST /ingest/readings  (legacy)
-│   │   ├── batch_ingest.py        # POST /ingest/readings/bulk  (legacy)
+│   │   ├── health.py              # GET /health, /health/postgres
+│   │   ├── packet_ingest.py       # POST /ingest/packets  ← IoT recomendado
+│   │   ├── single_ingest.py       # POST /ingest/readings  (IoT legacy)
+│   │   ├── batch_ingest.py        # POST /ingest/readings/bulk  (IoT legacy)
 │   │   ├── sensor_status.py       # GET /sensors/{id}/status
 │   │   ├── diagnostics.py         # GET /diagnostics
 │   │   └── resilience_health.py   # GET /resilience/health
 │   │
-│   ├── auth/                      # Autenticación
+│   ├── auth/                      # Autenticación y Autorización
 │   │   ├── api_key.py             # X-API-Key global (legacy/dev)
-│   │   └── device_key.py          # X-Device-Key por dispositivo (recomendado)
+│   │   ├── device_key.py          # X-Device-Key por dispositivo (IoT)
+│   │   ├── authorization.py       # Roles: ADMIN, SOURCE_WRITER, READ_ONLY (ISO 27001)
+│   │   └── api_key_validator.py   # Validación contra PostgreSQL con SHA-256
 │   │
 │   ├── broker/                    # Publicación de lecturas al ML
 │   │   ├── factory.py             # get_broker() — crea broker según config
@@ -107,19 +111,26 @@ iot_ingest_services/
 │   │   ├── connections.py         # Gestión de conexiones MQTT
 │   │   └── backpressure.py        # Backpressure (cola + semáforo)
 │   │
-│   ├── core/                      # Arquitectura modular (FF_MQTT_MODULAR_RECEIVER)
-│   │   ├── receiver.py            # start/stop_modular_receiver
-│   │   ├── domain/
-│   │   │   ├── reading.py         # Reading dataclass
-│   │   │   ├── contracts.py       # Contratos de dominio
+│   ├── core/                      # NÚCLEO UNIVERSAL AGNÓSTICO
+│   │   ├── receiver.py            # start/stop_modular_receiver (IoT)
+│   │   ├── domain/                # Contratos universales multi-dominio
+│   │   │   ├── data_point.py      # DataPoint (reemplaza Reading como universal)
+│   │   │   ├── stream_config.py   # StreamConfig + ValueConstraints
+│   │   │   ├── classification.py  # DataPointClass + ClassificationResult
+│   │   │   ├── series_id.py       # SeriesIdMapper (universal ↔ IoT)
+│   │   │   ├── reading.py         # Reading dataclass (IoT legacy)
+│   │   │   ├── contracts.py       # Contratos de dominio (IoT)
 │   │   │   └── broker_interface.py # IReadingBroker ABC
+│   │   ├── classification/        # Clasificador universal
+│   │   │   ├── universal_classifier.py  # UniversalClassifier (thread-safe)
+│   │   │   └── config_provider.py       # StreamConfigProvider + defaults
 │   │   ├── adapters/
-│   │   │   └── mqtt_adapter.py    # MQTTReadingAdapter
+│   │   │   └── mqtt_adapter.py    # MQTTReadingAdapter (IoT)
 │   │   ├── pipeline/
-│   │   │   ├── processor.py       # ReadingProcessor
-│   │   │   └── sp_executor.py     # SPExecutor
+│   │   │   ├── processor.py       # ReadingProcessor (IoT)
+│   │   │   └── sp_executor.py     # SPExecutor (IoT)
 │   │   ├── transport/
-│   │   │   ├── mqtt_client.py     # MQTTClient
+│   │   │   ├── mqtt_client.py     # MQTTClient (IoT)
 │   │   │   └── message_handler.py
 │   │   ├── validation/
 │   │   │   ├── payload_validator.py
@@ -130,6 +141,37 @@ iot_ingest_services/
 │   │   └── monitoring/
 │   │       ├── health.py          # HealthChecker
 │   │       └── stats.py           # StatsCollector
+│   │
+│   ├── adapters/                  # ADAPTERS DE DOMINIO
+│   │   └── iot/
+│   │       ├── adapter.py         # IoTAdapter: Reading ↔ DataPoint bridge
+│   │       └── __init__.py
+│   │
+│   ├── transports/                # TRANSPORTES UNIVERSALES (plugins)
+│   │   ├── base.py                # IngestTransport ABC
+│   │   ├── http/
+│   │   │   ├── transport.py       # HTTPTransport
+│   │   │   ├── schemas.py         # DataPacketIn, DataIngestResult
+│   │   │   └── endpoints.py       # POST /ingest/data (universal)
+│   │   ├── mqtt/
+│   │   │   ├── transport.py       # MQTTTransport (universal)
+│   │   │   └── receiver.py        # UniversalMQTTReceiver (FF_MQTT_UNIVERSAL)
+│   │   ├── websocket/
+│   │   │   └── handler.py         # WebSocket ingestion
+│   │   └── csv/
+│   │       ├── processor.py       # CSVProcessor
+│   │       └── endpoints.py       # POST /ingest/csv
+│   │
+│   ├── infrastructure/            # INFRAESTRUCTURA UNIVERSAL
+│   │   ├── persistence/
+│   │   │   ├── postgres.py        # PostgreSQLStorage (dominios no-IoT)
+│   │   │   ├── domain_storage_router.py  # Router: IoT→SQL Server, otros→PostgreSQL
+│   │   │   └── migrations/
+│   │   │       ├── postgres_001.sql      # Schema PostgreSQL
+│   │   │       ├── 001_audit_log.sql     # Audit trail table
+│   │   │       └── 002_api_keys_roles.sql # API keys con roles
+│   │   └── audit/
+│   │       └── audit_logger.py    # AuditLogger (ISO 27001 A.12.4)
 │   │
 │   ├── metrics/                   # Métricas de ingesta
 │   │   ├── service.py             # MetricsService
@@ -166,22 +208,33 @@ iot_ingest_services/
 | `GET` | `/sensors/{id}/status` | API Key | Estado operacional del sensor |
 | `GET` | `/diagnostics` | API Key | Diagnóstico interno |
 | `GET` | `/resilience/health` | — | Estado circuit breaker + DLQ |
-| `POST` | `/ingest/packets` | Device Key | **Recomendado** — paquete por device_uuid |
-| `POST` | `/ingest/readings` | API Key | Legacy — lectura única por sensor_id |
-| `POST` | `/ingest/readings/bulk` | API Key | Legacy — lote por sensor_id |
+| `POST` | `/ingest/packets` | Device Key | **IoT recomendado** — paquete por device_uuid |
+| `POST` | `/ingest/readings` | API Key | IoT legacy — lectura única por sensor_id |
+| `POST` | `/ingest/readings/bulk` | API Key | IoT legacy — lote por sensor_id |
+| `POST` | `/ingest/data` | API Key (roles) | **Universal** — ingesta multi-dominio (no IoT) |
+| `POST` | `/ingest/csv` | API Key | **Universal** — ingesta batch CSV |
+| `GET` | `/health/postgres` | — | Health check PostgreSQL |
 
-### Autenticación
+### Autenticación y Autorización
 
-| Header | Modo | Cuándo usar |
-|---|---|---|
-| `X-Device-Key` | Por dispositivo | `/ingest/packets` — producción |
-| `X-API-Key` | Global | Endpoints legacy, desarrollo |
+| Header | Modo | Cuándo usar | Dominios |
+|---|---|---|---|
+| `X-Device-Key` | Por dispositivo | `/ingest/packets` — producción | IoT |
+| `X-API-Key` | Global | Endpoints legacy, desarrollo | IoT |
+| `X-API-Key` | Con roles (PostgreSQL) | `/ingest/data`, `/ingest/csv` | Universal (no IoT) |
 
-Controlado por `DEVICE_AUTH_ENABLED=1` en `.env`.
+**Roles de autorización (ISO 27001 A.9.2.3):**
+- `ADMIN`: Acceso completo a todos los source_id y dominios
+- `SOURCE_WRITER`: Solo puede escribir en su source_id asignado
+- `READ_ONLY`: Sin permisos de escritura
+
+API keys universales se validan contra tabla `api_keys` en PostgreSQL con hash SHA-256.
+
+Controlado por `DEVICE_AUTH_ENABLED=1` (IoT) en `.env`.
 
 ---
 
-## Flujo de ingesta HTTP (`POST /ingest/packets`)
+## Flujo de ingesta IoT HTTP (`POST /ingest/packets`)
 
 ```
 POST /ingest/packets
@@ -213,7 +266,35 @@ POST /ingest/packets
 
 ---
 
-## Flujo MQTT (`FF_MQTT_INGEST_ENABLED=true`)
+## Flujo de ingesta Universal HTTP (`POST /ingest/data`)
+
+```
+POST /ingest/data
+  │
+  ├── Autenticación: X-API-Key → valida contra PostgreSQL (SHA-256)
+  ├── Autorización: verifica source_id ownership + domain permitido
+  ├── Rechaza domain='iot' (debe usar /ingest/packets)
+  │
+  └── Por cada DataPoint en el paquete:
+        │
+        ├── HTTPTransport.parse_message() → DataPoint
+        ├── SeriesIdMapper.build_series_id(domain, source, stream)
+        │
+        ├── UniversalClassifier.classify()
+        │     ├── StreamConfigProvider → carga constraints por stream
+        │     ├── Verifica: physical_range, operational_range, warning_zone
+        │     ├── Detecta: delta excesivo (absoluto/relativo)
+        │     └── → DataPointClass: NORMAL | WARNING | CRITICAL | ANOMALY
+        │
+        └── DomainStorageRouter.insert()
+              ├── domain='iot' → NotImplementedError (usar pipeline IoT)
+              └── otros dominios → PostgreSQL (data_points table)
+                                 → AuditLogger (ingestion_audit_log)
+```
+
+---
+
+## Flujo MQTT IoT (`FF_MQTT_INGEST_ENABLED=true`)
 
 ```
 Dispositivo/Simulador
@@ -228,15 +309,28 @@ Dispositivo/Simulador
             └── Redis XADD readings:validated  (opcional, para ML)
 ```
 
-Dos implementaciones seleccionables por feature flag:
-- `FF_MQTT_MODULAR_RECEIVER=false` → `mqtt/simple_receiver.py` (paho → SP directo)
-- `FF_MQTT_MODULAR_RECEIVER=true` → `core/receiver.py` (arquitectura modular)
+**Dos receptores MQTT independientes:**
+
+1. **MQTT IoT** (`FF_MQTT_INGEST_ENABLED=true`):
+   - Topics: `iot/sensors/{id}/readings`
+   - Implementaciones:
+     - `FF_MQTT_MODULAR_RECEIVER=false` → `mqtt/simple_receiver.py` (paho → SP directo)
+     - `FF_MQTT_MODULAR_RECEIVER=true` → `core/receiver.py` (arquitectura modular)
+
+2. **MQTT Universal** (`FF_MQTT_UNIVERSAL=true`):
+   - Topics: `{domain}/{source}/{stream}/data`
+   - Implementación: `transports/mqtt/receiver.py`
+   - Pipeline: MQTTTransport → UniversalClassifier → PostgreSQL
+   - Rechaza domain='iot' automáticamente
+   - Incluye deduplicación (5 min TTL)
 
 ---
 
-## Clasificación de lecturas
+## Clasificación de datos
 
-Cada lectura se clasifica **antes** de persistir en uno de tres flujos:
+### Clasificación IoT (ReadingClassifier)
+
+Cada lectura IoT se clasifica **antes** de persistir en uno de tres flujos:
 
 | Clase | Condición | Persiste en | Envía a ML |
 |---|---|---|---|
@@ -245,6 +339,19 @@ Cada lectura se clasifica **antes** de persistir en uno de tres flujos:
 | `ML_PREDICTION` | Dato limpio | `dbo.sensor_readings_latest` | ✅ Sí |
 
 Regla: **solo 1 alerta/advertencia activa por sensor** — se cierra la anterior antes de crear una nueva.
+
+### Clasificación Universal (UniversalClassifier)
+
+Cada DataPoint universal se clasifica según StreamConfig:
+
+| Clase | Condición | Persiste | Alerta |
+|---|---|---|---|
+| `NORMAL` | Dentro de todos los rangos | ✅ Sí | ❌ No |
+| `WARNING_VIOLATION` | Fuera de rango operacional o zona warning | ✅ Sí | ⚠️ Configurable |
+| `CRITICAL_VIOLATION` | Fuera de rango físico o zona crítica | ✅ Sí | ✅ Sí |
+| `ANOMALY_DETECTED` | Delta excesivo (absoluto/relativo) | ✅ Sí | ⚠️ Configurable |
+
+**Thread-safe:** UniversalClassifier usa locks para acceso concurrente a valores previos.
 
 ---
 
@@ -307,9 +414,11 @@ Si `ai-explainer` está caído: omite esa predicción y continúa (no bloquea).
 | `DB_PASSWORD` | — | Contraseña BD |
 | `DB_NAME` | `iot_monitoring_system` | Nombre BD |
 | `ODBC_DRIVER` | `ODBC Driver 17 for SQL Server` | Driver ODBC |
-| `FF_MQTT_INGEST_ENABLED` | `false` | Habilita receptor MQTT |
+| `FF_MQTT_INGEST_ENABLED` | `false` | Habilita receptor MQTT IoT |
 | `FF_MQTT_MODULAR_RECEIVER` | `false` | Usa `core/receiver.py` en vez de `mqtt/simple_receiver.py` |
-| `DEVICE_AUTH_ENABLED` | `0` | Habilita autenticación por dispositivo |
+| `FF_MQTT_UNIVERSAL` | `false` | Habilita receptor MQTT universal (dominios no-IoT) |
+| `DEVICE_AUTH_ENABLED` | `0` | Habilita autenticación por dispositivo (IoT) |
+| `POSTGRES_URL` | — | URL PostgreSQL para ingesta universal (ej: `postgresql://user:pass@host:5432/db`) |
 | `REDIS_URL` | `redis://localhost:6379/0` | URL Redis (dedup + DLQ) |
 | `REDIS_ENABLED` | `true` | Habilita Redis |
 | `BATCH_BUFFER_SIZE` | `100` | Tamaño buffer BatchInserter |
@@ -323,7 +432,8 @@ Si `ai-explainer` está caído: omite esa predicción y continúa (no bloquea).
 
 | Servicio | Dirección | Detalle |
 |---|---|---|
-| **SQL Server** (`iot_database`) | Lee/Escribe | `sensor_readings`, `sensor_readings_latest`, `alerts`, `alert_notifications`, `ml_events` |
+| **SQL Server** (`iot_database`) | Lee/Escribe (IoT) | `sensor_readings`, `sensor_readings_latest`, `alerts`, `alert_notifications`, `ml_events` |
+| **PostgreSQL** | Lee/Escribe (Universal) | `data_points`, `stream_configs`, `value_constraints`, `api_keys`, `ingestion_audit_log` |
 | **ML** (`iot_machine_learning`) | Import directo | `SensorProcessor`, `BatchEnterpriseContainer`, broker |
 | **Redis** | Escribe | Deduplicación (SET NX) + DLQ (List) + stream `readings:validated` (XADD) |
 | **AI Explainer** (`ai-explainer`) | HTTP POST | `/explain/anomaly` — solo desde `ai_explainer_runner.py` |
